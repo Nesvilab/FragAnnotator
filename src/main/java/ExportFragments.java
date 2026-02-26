@@ -41,17 +41,12 @@ import static com.compomics.util.experiment.biology.Ion.IonType.TAG_FRAGMENT_ION
 
 public class ExportFragments {
 
-
     private PeptideSpectrumAnnotator peptideSpectrumAnnotator = new PeptideSpectrumAnnotator();
     private AnnotationSettings annotationSettings = new AnnotationSettings();
     private PTMFactory ptmFactory = PTMFactory.getInstance();
 
     private File resultsFolder;
     private int threadNum = 1;
-    private HashMap<String, ScanCollectionDefault> scansFileHashMap = new HashMap<>();
-
-    private HashMap<String, ArrayList<String[]>> psmDataHashMap = new HashMap<>();
-    private HashMap<String, ArrayList<IonMatch>[]> ionMatchesHashMap = new HashMap<>();
     private ResultProcessor resultProcessor;
 
     public ExportFragments(File resultsFolder, AnnotationSettings annotationSettings, int threadNum) throws IOException {
@@ -81,10 +76,35 @@ public class ExportFragments {
             }
 
             try {
-                readRawFiles();
-                goThroughPSM();
-                getAnnotations();
-                writeAnnotations();
+                ExecutorService executorService = Executors.newFixedThreadPool(threadNum);
+
+                for (String expNum : resultProcessor.resultsDict.keySet()) {
+                    // 1. Read PSMs for this experiment only
+                    ArrayList<String[]> onePSMData = readOnePSM(expNum);
+                    if (onePSMData == null || onePSMData.isEmpty()) {
+                        continue;
+                    }
+
+                    // 2. Group PSM indices by mzML file name
+                    HashMap<String, ArrayList<Integer>> fileToIndices = groupPSMsByFile(onePSMData);
+
+                    // 3. Annotate per-file (one mzML loaded at a time)
+                    ArrayList<IonMatch>[] ionMatches = new ArrayList[onePSMData.size()];
+                    for (String fileName : fileToIndices.keySet()) {
+                        ScanCollectionDefault scans = openMzmlFile(fileName);
+                        if (scans != null) {
+                            annotateFileGroup(executorService, fileToIndices.get(fileName), onePSMData, ionMatches, scans);
+                        }
+                        // scans goes out of scope → GC can reclaim mzML data
+                    }
+
+                    // 4. Write immediately
+                    writeOneExperiment(expNum, onePSMData, ionMatches);
+
+                    // 5. onePSMData and ionMatches go out of scope → GC reclaims
+                }
+
+                executorService.shutdown();
             } catch (IOException | FileParsingException | SQLException | InterruptedException |
                      ClassNotFoundException | ExecutionException e) {
                 System.exit(1);
@@ -95,36 +115,79 @@ public class ExportFragments {
 
     }
 
-    private void readRawFiles(){
-        for (String spectrumName : resultProcessor.spectrumFileMap.keySet()){
-            System.out.println("Reading mzML: " + spectrumName);
-            File eachFile = new File(resultProcessor.spectrumFileMap.get(spectrumName));
-            if (eachFile.exists()) {
-                if (eachFile.getName().endsWith(".mzML")) {
-                    MZMLFile mzmlFile = new MZMLFile(resultProcessor.spectrumFileMap.get(spectrumName));
-                    mzmlFile.setNumThreadsForParsing(threadNum);
-                    ScanCollectionDefault scans = new ScanCollectionDefault();
-                    scans.setDefaultStorageStrategy(StorageStrategy.SOFT);
-                    scans.isAutoloadSpectra(true);
-                    scans.setDataSource(mzmlFile);
-                    try {
-                        scans.loadData(LCMSDataSubset.STRUCTURE_ONLY);
-                        scansFileHashMap.put(spectrumName, scans);
-                    } catch (FileParsingException e) {
-                        e.printStackTrace();
-                    }
-                }
-            }
-
+    private ScanCollectionDefault openMzmlFile(String spectrumName) {
+        if (!resultProcessor.spectrumFileMap.containsKey(spectrumName)) {
+            return null;
         }
-
+        File eachFile = new File(resultProcessor.spectrumFileMap.get(spectrumName));
+        if (eachFile.exists() && eachFile.getName().endsWith(".mzML")) {
+            System.out.println("Reading mzML: " + spectrumName);
+            MZMLFile mzmlFile = new MZMLFile(resultProcessor.spectrumFileMap.get(spectrumName));
+            mzmlFile.setNumThreadsForParsing(threadNum);
+            ScanCollectionDefault scans = new ScanCollectionDefault();
+            scans.setDefaultStorageStrategy(StorageStrategy.SOFT);
+            scans.isAutoloadSpectra(true);
+            scans.setDataSource(mzmlFile);
+            try {
+                scans.loadData(LCMSDataSubset.STRUCTURE_ONLY);
+                return scans;
+            } catch (FileParsingException e) {
+                e.printStackTrace();
+            }
+        }
+        return null;
     }
 
-    private MSnSpectrum getSpectrum(String spectrumTitle) throws FileParsingException {
+    private ArrayList<String[]> readOnePSM(String expNum) throws IOException {
+        System.out.println("Reading " + expNum);
+        File onePSMTable = resultProcessor.resultsDict.get(expNum).get(1);
+        ArrayList<String[]> onePSMData = new ArrayList<>();
+
+        if (checkFileOpen(onePSMTable)) {
+            String line;
+            String[] lineSplit;
+
+            BufferedReader bufferedReader = new BufferedReader(new FileReader(onePSMTable));
+            line = bufferedReader.readLine(); // skip header
+
+            while ((line = bufferedReader.readLine()) != null) {
+                lineSplit = line.split("\t");
+                onePSMData.add(lineSplit);
+            }
+            bufferedReader.close();
+        }
+        return onePSMData;
+    }
+
+    private HashMap<String, ArrayList<Integer>> groupPSMsByFile(ArrayList<String[]> onePSMData) {
+        HashMap<String, ArrayList<Integer>> fileToIndices = new HashMap<>();
+        for (int i = 0; i < onePSMData.size(); i++) {
+            String spectrumTitle = onePSMData.get(i)[0];
+            String fileName = spectrumTitle.split("\\.")[0];
+            fileToIndices.computeIfAbsent(fileName, k -> new ArrayList<>()).add(i);
+        }
+        return fileToIndices;
+    }
+
+    private void annotateFileGroup(ExecutorService executorService, ArrayList<Integer> psmIndices,
+                                   ArrayList<String[]> onePSMData, ArrayList<IonMatch>[] ionMatches,
+                                   ScanCollectionDefault scans) throws InterruptedException, ExecutionException {
+        System.out.println("Annotating " + psmIndices.size() + " PSMs from file");
+        ArrayList<ArrayList<Integer>> psmIndexMulti = splitIntoSublists(psmIndices, threadNum);
+        final ArrayList<Future<?>> futures = new ArrayList<>();
+        for (int i = 0; i < psmIndexMulti.size(); i++) {
+            ArrayList<Integer> oneIndexList = psmIndexMulti.get(i);
+            futures.add(executorService.submit(getOneAnnotation(oneIndexList, onePSMData, ionMatches, scans)));
+        }
+        for (Future<?> future : futures) {
+            future.get();
+        }
+    }
+
+    private MSnSpectrum getSpectrum(String spectrumTitle, ScanCollectionDefault scans) throws FileParsingException {
         String spectrumFileName = spectrumTitle.split("\\.")[0];
-        ScanCollectionDefault currentNum2scan  = scansFileHashMap.get(spectrumFileName);
         int scanNum = Integer.parseInt(spectrumTitle.split("\\.")[1]);
-        IScan iScan = currentNum2scan.getScanByNum(scanNum);
+        IScan iScan = scans.getScanByNum(scanNum);
         ISpectrum iSpectrum = iScan.fetchSpectrum();
 
         Charge charge = new Charge(1, Integer.parseInt(spectrumTitle.split("\\.")[3]));
@@ -156,106 +219,55 @@ public class ExportFragments {
         return new MSnSpectrum(2, precursor, spectrumTitle.split("\\.")[1], peakHashMap, spectrumFileName);
     }
 
-    private void goThroughPSM() throws IOException, FileParsingException, SQLException, InterruptedException, ClassNotFoundException {
-        for (String expNum : resultProcessor.resultsDict.keySet()) {
-            System.out.println("Reading " + expNum);
-
-            File onePSMTable = resultProcessor.resultsDict.get(expNum).get(1);
-            ArrayList<String[]> onePSMData = new ArrayList<>();
-
-            if (checkFileOpen(onePSMTable)){
-                String line;
-                String[] lineSplit;
-
-                BufferedReader bufferedReader = new BufferedReader(new FileReader(onePSMTable));
-                line = bufferedReader.readLine();
-
-                while ((line = bufferedReader.readLine()) != null) {
-                    lineSplit = line.split("\t");
-                    onePSMData.add(lineSplit);
-                }
-                psmDataHashMap.put(expNum, onePSMData);
-                bufferedReader.close();
-            }
-        }
-    }
-
-    private void writeAnnotations(){
+    private void writeOneExperiment(String expNum, ArrayList<String[]> onePSMData, ArrayList<IonMatch>[] ionMatches) {
         DecimalFormat df = new DecimalFormat("#.####");
         DecimalFormat dfInt = new DecimalFormat("#.#");
-        for (String expNum : psmDataHashMap.keySet()){
-            System.out.println("Writing " + expNum);
-            ArrayList<String[]> onePSMData = psmDataHashMap.get(expNum);
-            ArrayList<IonMatch>[] ionMatches = ionMatchesHashMap.get(expNum);
-            File onePSMTable = resultProcessor.resultsDict.get(expNum).get(1);
-            File onePSMTableWithMatch = new File(onePSMTable.getAbsolutePath().replace("psm.tsv", "psm_with_match.tsv"));
-            try {
-                BufferedWriter bufferedWriter = new BufferedWriter(new FileWriter(onePSMTableWithMatch));
-                BufferedReader bufferedReader = new BufferedReader(new FileReader(onePSMTable));
-                String line = bufferedReader.readLine();
-                int columnNum = line.split("\t").length;
-                bufferedWriter.write(line.stripTrailing() + "\tions\tion_mz\tion_int\n");
-                bufferedReader.close();
+        System.out.println("Writing " + expNum);
+        File onePSMTable = resultProcessor.resultsDict.get(expNum).get(1);
+        File onePSMTableWithMatch = new File(onePSMTable.getAbsolutePath().replace("psm.tsv", "psm_with_match.tsv"));
+        try {
+            BufferedWriter bufferedWriter = new BufferedWriter(new FileWriter(onePSMTableWithMatch));
+            BufferedReader bufferedReader = new BufferedReader(new FileReader(onePSMTable));
+            String line = bufferedReader.readLine();
+            int columnNum = line.split("\t").length;
+            bufferedWriter.write(line.stripTrailing() + "\tions\tion_mz\tion_int\n");
+            bufferedReader.close();
 
-                String[] lineSplit;
-                for (int i = 0; i < onePSMData.size(); i++){
-                    lineSplit = onePSMData.get(i);
-                    bufferedWriter.write(String.join("\t", lineSplit));
+            String[] lineSplit;
+            for (int i = 0; i < onePSMData.size(); i++){
+                lineSplit = onePSMData.get(i);
+                bufferedWriter.write(String.join("\t", lineSplit));
 
-                    ArrayList<String> ionsNames = new ArrayList<>();
-                    ArrayList<String> ionsMz = new ArrayList<>();
-                    ArrayList<String> ionsInt = new ArrayList<>();
-                    for (IonMatch ionMatch : ionMatches[i]){
-                        ionsNames.add(ionMatch.getPeakAnnotation());
-                        ionsMz.add(df.format(ionMatch.peak.mz));
-                        ionsInt.add(dfInt.format(ionMatch.peak.intensity));
-                    }
-                    if (lineSplit.length != columnNum){
-                        bufferedWriter.write("\t\t");
-                    }
-                    bufferedWriter.write("\t" + ionsNames + "\t" + ionsMz + "\t" + ionsInt + "\n");
+                ArrayList<String> ionsNames = new ArrayList<>();
+                ArrayList<String> ionsMz = new ArrayList<>();
+                ArrayList<String> ionsInt = new ArrayList<>();
+                for (IonMatch ionMatch : ionMatches[i]){
+                    ionsNames.add(ionMatch.getPeakAnnotation());
+                    ionsMz.add(df.format(ionMatch.peak.mz));
+                    ionsInt.add(dfInt.format(ionMatch.peak.intensity));
                 }
-                bufferedWriter.close();
-
-                onePSMTable.delete();
-                onePSMTableWithMatch.renameTo(onePSMTable);
-            } catch (IOException e) {
-                throw new RuntimeException(e);
+                if (lineSplit.length != columnNum){
+                    bufferedWriter.write("\t\t");
+                }
+                bufferedWriter.write("\t" + ionsNames + "\t" + ionsMz + "\t" + ionsInt + "\n");
             }
-        }
+            bufferedWriter.close();
 
+            onePSMTable.delete();
+            onePSMTableWithMatch.renameTo(onePSMTable);
+        } catch (IOException e) {
+            throw new RuntimeException(e);
+        }
     }
 
-    private void getAnnotations() throws InterruptedException, ExecutionException {
-        ExecutorService executorService = Executors.newFixedThreadPool(threadNum);
-        for (String expNum : psmDataHashMap.keySet()){
-            System.out.println("Annotating " + expNum);
-
-            ArrayList<String[]> onePSMData = psmDataHashMap.get(expNum);
-            ArrayList<IonMatch>[] ionMatches = new ArrayList[onePSMData.size()];
-
-//            getOneAnnotationSingle(onePSMData,  ionMatches);
-            ArrayList<ArrayList<Integer>> psmIndexMulti = splitIntoSublists(onePSMData.size(), threadNum);
-            final ArrayList<Future<?>> res1 = new ArrayList<>();
-            for (int i = 0; i < threadNum; i++) {
-                ArrayList<Integer> oneIndexList = psmIndexMulti.get(i);
-                res1.add(executorService.submit(getOneAnnotation(oneIndexList, onePSMData, ionMatches)));
-            }
-            for (Future<?> future : res1) {
-                future.get();
-            }
-            ionMatchesHashMap.put(expNum, ionMatches);
-        }
-        executorService.shutdown();
-    }
-
-    private Runnable getOneAnnotation(ArrayList<Integer> oneIndexList, ArrayList<String[]> onePSMData, ArrayList<IonMatch>[] ionMatches){
+    private Runnable getOneAnnotation(ArrayList<Integer> oneIndexList, ArrayList<String[]> onePSMData,
+                                      ArrayList<IonMatch>[] ionMatches, ScanCollectionDefault scans){
         return () -> {
             try {
                 for (int psmIndexCount : oneIndexList) {
                     String[] onePSM = onePSMData.get(psmIndexCount);
                     String spectrumTitle = onePSM[0];
-                    MSnSpectrum currentSpectrum = getSpectrum(spectrumTitle);
+                    MSnSpectrum currentSpectrum = getSpectrum(spectrumTitle, scans);
 
                     Peptide peptide = new Peptide(onePSM[resultProcessor.peptideSequenceIndex], getUtilitiesModifications(onePSM[resultProcessor.assignenModIndex], onePSM[resultProcessor.peptideSequenceIndex]));
 
@@ -271,30 +283,6 @@ public class ExportFragments {
                 e.printStackTrace();
             }
         };
-    }
-
-    private void getOneAnnotationSingle(ArrayList<String[]> onePSMData, ArrayList<IonMatch>[] ionMatches){
-
-        try {
-            for (int psmIndexCount = 0; psmIndexCount < onePSMData.size(); psmIndexCount++) {
-                String[] onePSM = onePSMData.get(psmIndexCount);
-                String spectrumTitle = onePSM[0];
-                MSnSpectrum currentSpectrum = getSpectrum(spectrumTitle);
-
-                Peptide peptide = new Peptide(onePSM[resultProcessor.peptideSequenceIndex], getUtilitiesModifications(onePSM[resultProcessor.assignenModIndex], onePSM[resultProcessor.peptideSequenceIndex]));
-
-                PeptideAssumption peptideAssumption = new PeptideAssumption(peptide, 1, 0, new Charge(+1, Integer.parseInt(onePSM[resultProcessor.chargeIndex])), 0, "*");
-
-                SpecificAnnotationSettings specificAnnotationSettings = annotationSettings.getSpecificAnnotationPreferences(spectrumTitle, peptideAssumption, SequenceMatchingPreferences.defaultStringMatching, SequenceMatchingPreferences.defaultStringMatching);
-
-                ArrayList<IonMatch> annotations = peptideSpectrumAnnotator.getSpectrumAnnotationFiter(annotationSettings, specificAnnotationSettings, currentSpectrum, peptide, null, ptmFactory, true);
-
-                ionMatches[psmIndexCount] = annotations;
-            }
-        } catch (SQLException | IOException | InterruptedException | ClassNotFoundException | FileParsingException e) {
-            e.printStackTrace();
-        }
-
     }
 
     private ArrayList<ModificationMatch> getUtilitiesModifications(String assignedMod, String peptideSequence){
@@ -380,8 +368,9 @@ public class ExportFragments {
         return null;
     }
 
-    private static ArrayList<ArrayList<Integer>> splitIntoSublists(Integer listSize, int numberOfSublists) {
+    private static ArrayList<ArrayList<Integer>> splitIntoSublists(ArrayList<Integer> indices, int numberOfSublists) {
         ArrayList<ArrayList<Integer>> sublists = new ArrayList<>();
+        int listSize = indices.size();
         int sublistSize = listSize / numberOfSublists;
         int remainingElements = listSize % numberOfSublists;
 
@@ -389,11 +378,11 @@ public class ExportFragments {
             int start = i * sublistSize;
             int end = (i + 1) * sublistSize;
             if (i == numberOfSublists - 1) {
-                end += remainingElements; // Add remaining elements to the last sublist
+                end += remainingElements;
             }
             ArrayList<Integer> sublist = new ArrayList<>();
             for (int j = start; j < end; j++) {
-                sublist.add(j);
+                sublist.add(indices.get(j));
             }
 
             sublists.add(sublist);
