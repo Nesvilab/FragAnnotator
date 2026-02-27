@@ -105,8 +105,8 @@ public class ExportFragments {
                 }
 
                 executorService.shutdown();
-            } catch (IOException | FileParsingException | SQLException | InterruptedException |
-                     ClassNotFoundException | ExecutionException e) {
+            } catch (IOException |  InterruptedException |
+                      ExecutionException e) {
                 System.exit(1);
                 throw new RuntimeException(e);
             }
