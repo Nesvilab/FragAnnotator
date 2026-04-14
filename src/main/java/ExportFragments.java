@@ -5,6 +5,9 @@ import umich.ms.datatypes.scancollection.impl.ScanCollectionDefault;
 import umich.ms.datatypes.spectrum.ISpectrum;
 import umich.ms.fileio.exceptions.FileParsingException;
 import umich.ms.fileio.filetypes.mzml.MZMLFile;
+import umich.ms.glyco.Glycan;
+import umich.ms.glyco.GlycanParser;
+import umich.ms.glyco.GlycanResidue;
 
 import java.io.*;
 import java.nio.file.Files;
@@ -23,11 +26,18 @@ public class ExportFragments {
     private boolean hasNgly;
     private boolean hasOgly;
 
-    public ExportFragments(File resultsFolder, int threadNum, List<String> ionsTypeArray) throws IOException {
+    private final String glycanResiduesPath;
+    private final String glycanModsPath;
+    private HashMap<String, GlycanResidue> glycanResiduesMap = new HashMap<>();
+
+    public ExportFragments(File resultsFolder, int threadNum, List<String> ionsTypeArray,
+            String glycanResiduesPath, String glycanModsPath) throws IOException {
         this.threadNum = threadNum;
         this.ionsTypeArray = ionsTypeArray;
         this.hasNgly = ionsTypeArray.contains("ngly") || ionsTypeArray.contains("gly");
         this.hasOgly = ionsTypeArray.contains("ogly") || ionsTypeArray.contains("gly");
+        this.glycanResiduesPath = glycanResiduesPath;
+        this.glycanModsPath     = glycanModsPath;
 
         importData(resultsFolder);
     }
@@ -41,6 +51,12 @@ public class ExportFragments {
             if (resultProcessor.psmIndexToName.containsValue("ionint") && resultProcessor.psmIndexToName.containsValue("ionmz")){
                 System.out.println("The file has already been annotated.");
                 System.exit(1);
+            }
+
+            // Initialise glycan residue/mod database before spawning threads so that
+            // glycoShortNames is fully populated before any concurrent access.
+            if (hasNgly || hasOgly) {
+                initGlycanResiduesMap();
             }
 
             try {
@@ -82,6 +98,27 @@ public class ExportFragments {
             }
             System.exit(0);
         }
+    }
+
+    /**
+     * Load the glycan residue and modification databases.
+     * Pre-populates {@link FragmentAnnotator#glycoShortNames} for all loaded residues
+     * so label generation is deterministic and thread-safe during annotation.
+     */
+    private void initGlycanResiduesMap() {
+        if (glycanResiduesPath != null && !glycanResiduesPath.isEmpty()) {
+            glycanResiduesMap = GlycanParser.parseGlycoResiduesDB(glycanResiduesPath);
+        }
+        if (glycanModsPath != null && !glycanModsPath.isEmpty()) {
+            HashMap<String, umich.ms.glyco.GlycanMod> modsMap =
+                    GlycanParser.parseGlycoModsDB(glycanModsPath, glycanResiduesMap.size(), glycanResiduesMap);
+            glycanResiduesMap.putAll(modsMap);
+        }
+        // Pre-register short names for all loaded residues before threads start.
+        for (GlycanResidue residue : glycanResiduesMap.values()) {
+            FragmentAnnotator.getOrCreateShortName(residue);
+        }
+        System.out.println("Loaded " + glycanResiduesMap.size() + " glycan residue/mod definitions.");
     }
 
     // Build per-type ionMatches storage.
@@ -299,6 +336,19 @@ public class ExportFragments {
                     String peptideSequence = onePSM[resultProcessor.peptideSequenceIndex];
                     ArrayList<ModificationMatch> originalMods = parseModifications(assignedMod, peptideSequence);
 
+                    // Parse glycan composition from "Total Glycan Composition" column if present.
+                    // Parsed once per PSM; passed to all annotation passes (used only when
+                    // addGlycanIons = true, i.e., the _ori passes).
+                    Glycan glycan = null;
+                    if (anyGlycan && !glycanResiduesMap.isEmpty()
+                            && resultProcessor.glycanCompositionIndex >= 0
+                            && resultProcessor.glycanCompositionIndex < onePSM.length) {
+                        String glycanStr = onePSM[resultProcessor.glycanCompositionIndex].trim();
+                        if (!glycanStr.isEmpty()) {
+                            glycan = GlycanParser.parseGlycanString(glycanStr, glycanResiduesMap);
+                        }
+                    }
+
                     for (Map.Entry<String, ArrayList<IonMatch>[]> entry : ionMatchesMap.entrySet()) {
                         String type = entry.getKey();
                         ArrayList<IonMatch>[] typeIonMatches = entry.getValue();
@@ -310,7 +360,7 @@ public class ExportFragments {
                         typeIonMatches[psmIndexCount] = FragmentAnnotator.annotate(
                                 peptideSequence, activeMods, chargeValue,
                                 primaryMzs, primaryIns,
-                                ionsTypeArray, addGlycan, neutral);
+                                ionsTypeArray, addGlycan, neutral, glycan);
 
                         if (pairedIonMatchesMap != null) {
                             ArrayList<IonMatch>[] pairedTypeIonMatches = pairedIonMatchesMap.get(type);
@@ -318,7 +368,7 @@ public class ExportFragments {
                                 pairedTypeIonMatches[psmIndexCount] = FragmentAnnotator.annotate(
                                         peptideSequence, activeMods, chargeValue,
                                         pairedMzs, pairedIns,
-                                        ionsTypeArray, addGlycan, neutral);
+                                        ionsTypeArray, addGlycan, neutral, glycan);
                             }
                         }
                     }

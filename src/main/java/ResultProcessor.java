@@ -77,7 +77,7 @@ public class ResultProcessor {
     /**
      * Protein result file column index
      */
-    public int spectrumIndex = -1, peptideSequenceIndex = -1, chargeIndex = -1, caculatedMZIndex = -1, observedMZIndex = -1, assignenModIndex = -1, pairedScanNumIndex = -1;
+    public int spectrumIndex = -1, peptideSequenceIndex = -1, chargeIndex = -1, caculatedMZIndex = -1, observedMZIndex = -1, assignenModIndex = -1, pairedScanNumIndex = -1, glycanCompositionIndex = -1;
 
 
     public ResultProcessor(File resultsFolder) {
@@ -369,6 +369,8 @@ public class ResultProcessor {
             } else if (header.equalsIgnoreCase("Assigned Modifications")) {
                 psmIndexToName.put(i, header.trim().replace(" ", ""));
                 assignenModIndex = i;
+            } else if (header.equalsIgnoreCase("Total Glycan Composition")) {
+                glycanCompositionIndex = i;
             } else if (header.equalsIgnoreCase("Paired Scan Num")) {
                 hasPairedScanNum = true;
                 pairedScanNumIndex = i;

@@ -1,3 +1,6 @@
+import umich.ms.glyco.Glycan;
+import umich.ms.glyco.GlycanResidue;
+
 import java.util.*;
 
 /**
@@ -58,10 +61,6 @@ public class FragmentAnnotator {
     public static final double NEUGC_RESIDUE  = 307.09033; // NeuGc
     public static final double DHEX_RESIDUE   = 146.05791; // dHex (Fucose)
 
-    // Sugar single-letter codes (N=HexNAc, H=Hex, A=NeuAc, G=NeuGc, F=Fucose)
-    private static final String[] SUGAR_LETTERS = {"N", "H", "A", "G", "F"};
-    private static final double[] SUGAR_MASSES  = {HEXNAC_RESIDUE, HEX_RESIDUE, NEUAC_RESIDUE, NEUGC_RESIDUE, DHEX_RESIDUE};
-
     // Common singly-charged oxonium B ions: {compact label, m/z}
     // m/z = sum(sugar_residue_masses) + PROTON
     private static final Object[][] OXONIUM_IONS = {
@@ -85,20 +84,34 @@ public class FragmentAnnotator {
         {"B_N1F1",       DHEX_RESIDUE + HEXNAC_RESIDUE + PROTON},
     };
 
+    // Glycan residue short names for compact Y ion labels.
+    // Pre-populated with the five common monosaccharides; additional entries are
+    // generated on demand by getOrCreateShortName().
+    public static final HashMap<String, String> glycoShortNames = new HashMap<>();
+    static {
+        glycoShortNames.put("HexNAc", "N");
+        glycoShortNames.put("Hex",    "H");
+        glycoShortNames.put("Fuc",    "F");
+        glycoShortNames.put("NeuAc",  "A");
+        glycoShortNames.put("NeuGc",  "G");
+    }
+
     // PPM tolerance for peak matching
     private static final double PPM_TOL = 20.0;
 
     /**
      * Annotate a spectrum.
      *
-     * @param sequence       peptide sequence (single-letter codes, upper-case)
-     * @param mods           list of modifications (position 1-indexed)
+     * @param sequence        peptide sequence (single-letter codes, upper-case)
+     * @param mods            list of modifications (position 1-indexed)
      * @param precursorCharge precursor charge state
-     * @param specMzs        sorted observed m/z values
-     * @param specInts       observed intensities (same order as specMzs)
-     * @param ionTypes       list of ion type tokens: "a","b","c","x","y","z"
-     * @param addGlycanIons  whether to generate glycan B/Y ions (for ori variants)
-     * @param addNeutralLoss whether to annotate neutral loss variants
+     * @param specMzs         sorted observed m/z values
+     * @param specInts        observed intensities (same order as specMzs)
+     * @param ionTypes        list of ion type tokens: "a","b","c","x","y","z"
+     * @param addGlycanIons   whether to generate glycan B/Y ions (for ori variants)
+     * @param addNeutralLoss  whether to annotate neutral loss variants
+     * @param glycan          parsed glycan composition from "Total Glycan Composition"
+     *                        column; may be null if unavailable (Y ions are skipped)
      * @return list of matched IonMatch objects
      */
     public static ArrayList<IonMatch> annotate(
@@ -109,7 +122,8 @@ public class FragmentAnnotator {
             double[] specInts,
             List<String> ionTypes,
             boolean addGlycanIons,
-            boolean addNeutralLoss) {
+            boolean addNeutralLoss,
+            Glycan glycan) {
 
         ArrayList<IonMatch> result = new ArrayList<>();
         if (specMzs == null || specMzs.length == 0) return result;
@@ -208,26 +222,6 @@ public class FragmentAnnotator {
 
         // ── Glycan ions (only for ori annotation passes) ────────────────────
         if (addGlycanIons) {
-            // Identify glycan mods (N-glycan: mass>500 on N; O-glycan: mass>100 on S/T)
-            double glycanMass = 0.0;
-            boolean isNGlycan = false;
-            for (ModificationMatch mm : mods) {
-                String ptm = mm.getTheoreticPtm();
-                if (ptm.contains(" of ")) {
-                    String residue = ptm.split(" of ")[1];
-                    double mass = mm.getMass();
-                    if (residue.equals("N") && (mass > 500 || ptm.startsWith("203.079") || ptm.startsWith("0.0"))) {
-                        glycanMass = mass;
-                        isNGlycan = true;
-                        break;
-                    } else if ((residue.equals("S") || residue.equals("T") || residue.equals("ST"))
-                            && (mass > 100 || ptm.startsWith("0.0"))) {
-                        glycanMass = mass;
-                        break;
-                    }
-                }
-            }
-
             // Glycan B (oxonium) ions — singly charged only
             for (Object[] entry : OXONIUM_IONS) {
                 double mz = (double) entry[1];
@@ -236,11 +230,10 @@ public class FragmentAnnotator {
                     result.add(new IonMatch((String) entry[0], specMzs[peakIdx], specInts[peakIdx], mz));
             }
 
-            // Glycan Y ions: bare peptide + partial glycan compositions
-            // Bare peptide mass = total mass - glycan mass at N/O site
-            if (glycanMass > 0) {
-                double barePeptideMass = totalPeptideMass - glycanMass;
-                generateGlycanYIons(result, specMzs, specInts, barePeptideMass, glycanMass, maxCharge);
+            // Glycan Y ions: enumerate all valid fragment compositions of the glycan
+            if (glycan != null) {
+                double barePeptideMass = totalPeptideMass - glycan.mass;
+                generateGlycanYIons(result, specMzs, specInts, barePeptideMass, glycan, maxCharge);
             }
         }
 
@@ -248,68 +241,70 @@ public class FragmentAnnotator {
     }
 
     /**
-     * Generate glycan Y ions by enumerating partial glycan compositions
-     * (as sugar residue combinations) up to the full glycan mass.
+     * Generate glycan Y ions by enumerating every valid fragment sub-composition
+     * of the supplied glycan using {@link Glycan#generateFragmentCompositions()}.
+     * Only compositions that are actual sub-sets of the intact glycan are produced,
+     * replacing the previous approach of enumerating all combinations of a fixed
+     * set of five sugar types up to arbitrary maximum counts.
      */
     private static void generateGlycanYIons(
             ArrayList<IonMatch> result,
             double[] specMzs, double[] specInts,
             double barePeptideMass,
-            double glycanMass,
+            Glycan glycan,
             int maxCharge) {
 
-        // Max amounts of each sugar (HexNAc, Hex, NeuAc, NeuGc, dHex)
-        // Capped at reasonable values; the mass guard will prune over-large combos.
-        int[] maxCounts = {10, 10, 5, 3, 4};
-
-        // Depth-limited enumeration — 5 nested loops but pruned early by mass.
-        // Only generate combos with total residue mass <= glycanMass + 1 Da.
-        // Skip the empty combo (0,0,0,0,0).
-        for (int n0 = 0; n0 <= maxCounts[0]; n0++) {
-            double m0 = n0 * SUGAR_MASSES[0];
-            if (m0 > glycanMass + 1.0) break;
-            for (int n1 = 0; n1 <= maxCounts[1]; n1++) {
-                double m1 = m0 + n1 * SUGAR_MASSES[1];
-                if (m1 > glycanMass + 1.0) break;
-                for (int n2 = 0; n2 <= maxCounts[2]; n2++) {
-                    double m2 = m1 + n2 * SUGAR_MASSES[2];
-                    if (m2 > glycanMass + 1.0) break;
-                    for (int n3 = 0; n3 <= maxCounts[3]; n3++) {
-                        double m3 = m2 + n3 * SUGAR_MASSES[3];
-                        if (m3 > glycanMass + 1.0) break;
-                        for (int n4 = 0; n4 <= maxCounts[4]; n4++) {
-                            double comboMass = m3 + n4 * SUGAR_MASSES[4];
-                            if (comboMass > glycanMass + 1.0) break;
-                            if (n0 + n1 + n2 + n3 + n4 == 0) continue; // skip bare peptide
-
-                            double yMass = barePeptideMass + comboMass;
-                            // Build label lazily — only when a peak match is found.
-                            String label = null;
-                            for (int z = 1; z <= maxCharge; z++) {
-                                double mz = (yMass + z * PROTON) / z;
-                                int peakIdx = findBestPeak(specMzs, mz);
-                                if (peakIdx >= 0) {
-                                    if (label == null) label = buildGlycanYLabel(n0, n1, n2, n3, n4);
-                                    result.add(new IonMatch(label + chargeStr(z), specMzs[peakIdx], specInts[peakIdx], mz));
-                                }
-                            }
-                        }
-                    }
+        List<LinkedHashMap<GlycanResidue, Integer>> fragComps = glycan.generateFragmentCompositions();
+        for (LinkedHashMap<GlycanResidue, Integer> fragComp : fragComps) {
+            double comboMass = Glycan.computeCompositionMass(fragComp);
+            double yMass = barePeptideMass + comboMass;
+            // Build label lazily — only when a peak match is found.
+            String label = null;
+            for (int z = 1; z <= maxCharge; z++) {
+                double mz = (yMass + z * PROTON) / z;
+                int peakIdx = findBestPeak(specMzs, mz);
+                if (peakIdx >= 0) {
+                    if (label == null) label = buildGlycanYLabel(fragComp);
+                    result.add(new IonMatch(label + chargeStr(z), specMzs[peakIdx], specInts[peakIdx], mz));
                 }
             }
         }
     }
 
     /**
-     * Build a compact Y_ label from sugar counts.
-     * e.g. (2, 1, 0, 0, 0) → "Y_N2H1"
+     * Build a compact Y_ label from a fragment composition map.
+     * e.g. {HexNAc→2, Hex→1} → "Y_N2H1"
+     * Uses {@link #glycoShortNames}; new entries are registered on demand.
      */
-    private static String buildGlycanYLabel(int... counts) {
+    private static String buildGlycanYLabel(LinkedHashMap<GlycanResidue, Integer> fragComp) {
         StringBuilder sb = new StringBuilder("Y_");
-        for (int i = 0; i < SUGAR_LETTERS.length; i++) {
-            if (counts[i] > 0) sb.append(SUGAR_LETTERS[i]).append(counts[i]);
+        for (Map.Entry<GlycanResidue, Integer> entry : fragComp.entrySet()) {
+            sb.append(getOrCreateShortName(entry.getKey())).append(entry.getValue());
         }
         return sb.toString();
+    }
+
+    /**
+     * Return the short name for a glycan residue, registering a new one if needed.
+     * Finds the shortest prefix of {@code residue.name} that is not already a value
+     * in {@link #glycoShortNames}. Synchronized to be safe when called from
+     * multiple threads (residues are pre-registered at startup, so contention is rare).
+     */
+    static synchronized String getOrCreateShortName(GlycanResidue residue) {
+        String name = residue.name;
+        String existing = glycoShortNames.get(name);
+        if (existing != null) return existing;
+        Set<String> usedValues = new HashSet<>(glycoShortNames.values());
+        String shortName = name; // fallback: use full name if all prefixes are taken
+        for (int len = 1; len <= name.length(); len++) {
+            String candidate = name.substring(0, len);
+            if (!usedValues.contains(candidate)) {
+                shortName = candidate;
+                break;
+            }
+        }
+        glycoShortNames.put(name, shortName);
+        return shortName;
     }
 
     // Precomputed charge suffix strings to avoid repeated String.repeat() allocations

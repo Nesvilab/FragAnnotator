@@ -11,19 +11,24 @@ public class FragmentsExportMainClass {
             new LinkedHashSet<>(Arrays.asList("a", "b", "c", "x", "y", "z"));
 
     public static void main(String[] args) {
-        File resultsFolder = new File(args[0]);
-        int threadsNumber  = Integer.parseInt(args[1]);
-        String ionsTypes   = args[2];
+        File resultsFolder    = new File(args[0]);
+        int threadsNumber     = Integer.parseInt(args[1]);
+        String ionsTypes      = args[2];
+        String glycanResiduesPath = args.length > 3 ? args[3] : "";
+        String glycanModsPath     = args.length > 4 ? args[4] : "";
         try {
-            new FragmentsExportMainClass(resultsFolder, threadsNumber, ionsTypes);
+            new FragmentsExportMainClass(resultsFolder, threadsNumber, ionsTypes,
+                    glycanResiduesPath, glycanModsPath);
         } catch (IOException e) {
             throw new RuntimeException(e);
         }
     }
 
-    public FragmentsExportMainClass(File resultsFolder, int threadsNumber, String ionsTypes) throws IOException {
+    public FragmentsExportMainClass(File resultsFolder, int threadsNumber, String ionsTypes,
+            String glycanResiduesPath, String glycanModsPath) throws IOException {
         List<String> ionsTypeArray = parseIonTypes(ionsTypes);
-        new ExportFragments(resultsFolder, threadsNumber, ionsTypeArray);
+        new ExportFragments(resultsFolder, threadsNumber, ionsTypeArray,
+                glycanResiduesPath, glycanModsPath);
     }
 
     /**
