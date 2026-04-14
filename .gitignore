@@ -98,3 +98,7 @@ target
 *.png
 figure_glyco_updates.py
 figure_glyco_updates.svg
+
+#claude
+*.claude
+claude.*
