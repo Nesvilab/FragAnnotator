@@ -3,12 +3,17 @@ import java.util.*;
 
 public class FragmentsExportMainClass {
 
-    // Recognised multi-character keywords (non-backbone modifiers).
-    private static final Set<String> KEYWORDS =
-            new LinkedHashSet<>(Arrays.asList("ngly", "ogly", "gly", "neu"));
-    // Recognised backbone ion letters.
-    private static final Set<String> LETTERS  =
+    /** Recognised backbone ion letters. */
+    private static final Set<String> LETTERS =
             new LinkedHashSet<>(Arrays.asList("a", "b", "c", "x", "y", "z"));
+    /**
+     * Ion-type keywords the glyco modes used. They no longer select anything: glycan ions are now
+     * annotated from the search's own labile parameters, and whether a PSM gets composition labels
+     * is decided by its own glycan composition. Accepted and ignored so an older FragPipe that
+     * still passes them does not fail.
+     */
+    private static final Set<String> RETIRED_KEYWORDS =
+            new LinkedHashSet<>(Arrays.asList("ngly", "ogly", "gly"));
 
     public static void main(String[] args) {
         File resultsFolder    = new File(args[0]);
@@ -26,94 +31,99 @@ public class FragmentsExportMainClass {
 
     public FragmentsExportMainClass(File resultsFolder, int threadsNumber, String ionsTypes,
             String glycanResiduesPath, String glycanModsPath) throws IOException {
-        List<String> ionsTypeArray = parseIonTypes(ionsTypes);
-        new ExportFragments(resultsFolder, threadsNumber, ionsTypeArray,
+        Options options = parseIonTypes(ionsTypes);
+        new ExportFragments(resultsFolder, threadsNumber, options.letters, options.neutralLoss,
                 glycanResiduesPath, glycanModsPath);
     }
 
+    /** What the ion-types argument asked for, beyond what the search itself states. */
+    static class Options {
+        /** Backbone letters to annotate instead of the search's own; empty means "use the search's". */
+        final List<String> letters;
+        /** Whether to annotate neutral-loss variants of b and y. */
+        final boolean neutralLoss;
+
+        Options(List<String> letters, boolean neutralLoss) {
+            this.letters = letters;
+            this.neutralLoss = neutralLoss;
+        }
+    }
+
     /**
-     * Parse the ion-types argument into a canonical list of tokens.
+     * Parse the ion-types argument.
      *
-     * <p>Contract with FragPipe (see {@code CmdExportMatchedFragments.java}
-     * in the FragPipe repo): when the user leaves the fragment-type selector
-     * at its default (b and y), FragPipe passes the sentinel string
-     * {@code "r"} on the command line. This parser therefore treats
-     * {@code "r"} (case-insensitive) as an alias for {@code b_y}.
+     * <p>The search's own {@code fragpipe.workflow} is the source of truth for which ion series
+     * were generated, at what tolerance, and with what custom and labile definitions. This
+     * argument only overrides the standard backbone letters, for a user who wants a different
+     * picture from the one the search produced.
      *
-     * <p>Additionally accepts a flexible input format so hand-typed args are
-     * not silently punished for using commas, spaces, or concatenated letters:
+     * <p>Contract with FragPipe (see {@code CmdExportMatchedFragments.java} in the FragPipe repo):
+     * when the user leaves the fragment-type selector at its default, FragPipe passes the sentinel
+     * {@code "r"}. That — like an empty argument — means "take the ion series from the search",
+     * which is now the case that does the right thing on its own.
+     *
+     * <p>Accepts a flexible input format so hand-typed args are not silently punished:
      * <ul>
      *   <li>separators: {@code _}, {@code ,}, whitespace, {@code +}, {@code /}</li>
-     *   <li>multi-char keywords (case-insensitive): {@code ngly}, {@code ogly},
-     *       {@code gly}, {@code neu}</li>
-     *   <li>backbone ion letters: {@code a b c x y z}</li>
-     *   <li>any remaining token whose characters are all backbone letters is
-     *       split per-character, so {@code by} &rarr; {@code [b, y]}</li>
+     *   <li>backbone ion letters: {@code a b c x y z}, also concatenated ({@code by})</li>
+     *   <li>{@code neu}: also annotate neutral losses of b and y</li>
+     *   <li>{@code ngly}/{@code ogly}/{@code gly}: accepted and ignored (see
+     *       {@link #RETIRED_KEYWORDS})</li>
      * </ul>
-     *
-     * <p>If after parsing there is no backbone ion letter (a/b/c/x/y/z), a
-     * warning is printed and the parser defaults to {@code b, y} so the run
-     * still produces useful annotations instead of silently emitting empty
-     * columns.
      */
-    static List<String> parseIonTypes(String ionsTypes) {
-        LinkedHashSet<String> out = new LinkedHashSet<>();
+    static Options parseIonTypes(String ionsTypes) {
+        LinkedHashSet<String> letters = new LinkedHashSet<>();
+        boolean neutralLoss = false;
         List<String> unrecognized = new ArrayList<>();
+        List<String> retired = new ArrayList<>();
 
-        // FragPipe default-selection sentinel → b, y
         if (ionsTypes != null && ionsTypes.trim().equalsIgnoreCase("r")) {
-            out.add("b");
-            out.add("y");
-            List<String> list = new ArrayList<>(out);
-            System.out.println("Using ion types: " + list + " (FragPipe default)");
-            return list;
+            System.out.println("Ion types: taking the search's own fragment_ion_series "
+                    + "(FragPipe default selection).");
+            return new Options(Collections.emptyList(), false);
         }
 
         if (ionsTypes != null && !ionsTypes.trim().isEmpty()) {
-            String[] tokens = ionsTypes.trim().toLowerCase().split("[_,\\s+/]+");
-            for (String token : tokens) {
+            for (String token : ionsTypes.trim().toLowerCase().split("[_,\\s+/]+")) {
                 if (token.isEmpty()) continue;
-                if (KEYWORDS.contains(token) || LETTERS.contains(token)) {
-                    out.add(token);
-                    continue;
-                }
-                // Concatenated backbone letters (e.g. "by" -> b,y)
-                boolean allLetters = !token.isEmpty();
-                for (int i = 0; i < token.length(); i++) {
-                    if (!LETTERS.contains(String.valueOf(token.charAt(i)))) {
-                        allLetters = false;
-                        break;
-                    }
-                }
-                if (allLetters) {
-                    for (int i = 0; i < token.length(); i++) {
-                        out.add(String.valueOf(token.charAt(i)));
-                    }
+                if (token.equals("neu")) {
+                    neutralLoss = true;
+                } else if (RETIRED_KEYWORDS.contains(token)) {
+                    retired.add(token);
+                } else if (LETTERS.contains(token)) {
+                    letters.add(token);
+                } else if (allLetters(token)) {
+                    // Concatenated backbone letters (e.g. "by" -> b,y)
+                    for (int i = 0; i < token.length(); i++) letters.add(String.valueOf(token.charAt(i)));
                 } else {
                     unrecognized.add(token);
                 }
             }
         }
 
+        if (!retired.isEmpty()) {
+            System.out.println("Note: ion-type keyword(s) " + retired + " are no longer needed and "
+                    + "were ignored. Glycan and other labile ions are now annotated automatically "
+                    + "from the search's own parameters.");
+        }
         if (!unrecognized.isEmpty()) {
             System.err.println("WARNING: unrecognized ion-type token(s): " + unrecognized
-                    + ". Valid letters: a/b/c/x/y/z. Valid keywords: ngly/ogly/gly/neu.");
+                    + ". Valid letters: a/b/c/x/y/z. Valid keyword: neu.");
         }
 
-        // Ensure at least one backbone ion letter is present, else default to b,y.
-        boolean hasBackbone = false;
-        for (String t : out) {
-            if (LETTERS.contains(t)) { hasBackbone = true; break; }
+        List<String> list = new ArrayList<>(letters);
+        if (list.isEmpty()) {
+            System.out.println("Ion types: taking the search's own fragment_ion_series.");
+        } else {
+            System.out.println("Ion types: " + list + " (overriding the search's fragment_ion_series)");
         }
-        if (!hasBackbone) {
-            System.err.println("WARNING: no valid backbone ion types parsed from '" + ionsTypes
-                    + "'; defaulting to b, y");
-            out.add("b");
-            out.add("y");
-        }
+        return new Options(list, neutralLoss);
+    }
 
-        List<String> list = new ArrayList<>(out);
-        System.out.println("Using ion types: " + list);
-        return list;
+    private static boolean allLetters(String token) {
+        for (int i = 0; i < token.length(); i++) {
+            if (!LETTERS.contains(String.valueOf(token.charAt(i)))) return false;
+        }
+        return !token.isEmpty();
     }
 }

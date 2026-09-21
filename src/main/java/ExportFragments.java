@@ -17,25 +17,38 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 public class ExportFragments {
 
     private int threadNum = 1;
     private ResultProcessor resultProcessor;
-    private List<String> ionsTypeArray;
-    private boolean hasNgly;
-    private boolean hasOgly;
+
+    /** Backbone ion types named on the command line; empty means "use the search's own". */
+    private final List<String> overrideIonTypes;
+    private final boolean addNeutralLoss;
+
+    /** The search's own parameters, read from fragpipe.workflow. */
+    private SearchParams search;
+    /** Backbone series to generate: the search's standard letters plus every custom definition. */
+    private List<FragmentAnnotator.Series> backboneSeries = new ArrayList<>();
+    /** Series that carry fragment remainders (msfragger.labile_fragment_ion_series). */
+    private List<FragmentAnnotator.Series> labileSeries = new ArrayList<>();
+    /** The ion categories this result gets columns for. */
+    private List<IonCategory> categories = new ArrayList<>();
 
     private final String glycanResiduesPath;
     private final String glycanModsPath;
     private HashMap<String, GlycanResidue> glycanResiduesMap = new HashMap<>();
 
-    public ExportFragments(File resultsFolder, int threadNum, List<String> ionsTypeArray,
-            String glycanResiduesPath, String glycanModsPath) throws IOException {
+    /** Warn at most once per run that a glyco search has no glycan compositions to name ions with. */
+    private final AtomicBoolean warnedNoGlycanColumn = new AtomicBoolean(false);
+
+    public ExportFragments(File resultsFolder, int threadNum, List<String> overrideIonTypes,
+            boolean addNeutralLoss, String glycanResiduesPath, String glycanModsPath) throws IOException {
         this.threadNum = threadNum;
-        this.ionsTypeArray = ionsTypeArray;
-        this.hasNgly = ionsTypeArray.contains("ngly") || ionsTypeArray.contains("gly");
-        this.hasOgly = ionsTypeArray.contains("ogly") || ionsTypeArray.contains("gly");
+        this.overrideIonTypes = overrideIonTypes;
+        this.addNeutralLoss = addNeutralLoss;
         this.glycanResiduesPath = glycanResiduesPath;
         this.glycanModsPath     = glycanModsPath;
 
@@ -48,16 +61,19 @@ public class ExportFragments {
 
         if (resultProcessor.manifestFile != null) {
 
-            if (resultProcessor.psmIndexToName.containsValue("ionint") && resultProcessor.psmIndexToName.containsValue("ionmz")){
-                System.out.println("The file has already been annotated.");
+            if (resultProcessor.psmIndexToName.containsValue("ionint") && resultProcessor.psmIndexToName.containsValue("ionmz")) {
+                System.err.println("This psm.tsv already carries ion annotation columns "
+                        + "(ions / ion_mz / ion_int), so it was written by a previous run of this tool. "
+                        + "Annotation rewrites psm.tsv in place and cannot be repeated on its own output. "
+                        + "Re-run Philosopher to regenerate psm.tsv, then annotate it again.");
                 System.exit(1);
             }
 
-            // Initialise glycan residue/mod database before spawning threads so that
+            configureFromSearch(resultsFolder);
+
+            // Initialise the glycan residue/mod database before spawning threads so that
             // glycoShortNames is fully populated before any concurrent access.
-            if (hasNgly || hasOgly) {
-                initGlycanResiduesMap();
-            }
+            initGlycanResiduesMap();
 
             try {
                 ExecutorService executorService = Executors.newFixedThreadPool(threadNum);
@@ -68,8 +84,8 @@ public class ExportFragments {
 
                     HashMap<String, ArrayList<Integer>> fileToIndices = groupPSMsByFile(onePSMData);
 
-                    LinkedHashMap<String, ArrayList<IonMatch>[]> ionMatchesMap = buildIonMatchesMap(onePSMData.size());
-                    LinkedHashMap<String, ArrayList<IonMatch>[]> pairedIonMatchesMap =
+                    LinkedHashMap<IonCategory, ArrayList<IonMatch>[]> ionMatchesMap = buildIonMatchesMap(onePSMData.size());
+                    LinkedHashMap<IonCategory, ArrayList<IonMatch>[]> pairedIonMatchesMap =
                             resultProcessor.hasPairedScanNum ? buildIonMatchesMap(onePSMData.size()) : null;
 
                     // Open all mzML files and queue per-PSM tasks without waiting between files.
@@ -101,9 +117,107 @@ public class ExportFragments {
     }
 
     /**
-     * Load the glycan residue and modification databases.
-     * Pre-populates {@link FragmentAnnotator#glycoShortNames} for all loaded residues
-     * so label generation is deterministic and thread-safe during annotation.
+     * Read the search's own settings and decide what to annotate with them: which backbone series,
+     * at what tolerance, and whether the three labile categories apply at all.
+     */
+    private void configureFromSearch(File resultsFolder) {
+        search = SearchParams.read(resultsFolder);
+        FragmentAnnotator.configureTolerance(search.fragTol, search.fragTolDa);
+        System.out.println("Fragment tolerance: " + search.fragTol + (search.fragTolDa ? " Da" : " ppm"));
+
+        // Standard letters come from the search unless the command line named its own. Custom
+        // series are always generated: MSFragger generates every definition it is given, whether
+        // or not fragment_ion_series also names it.
+        List<String> letters = overrideIonTypes.isEmpty()
+                ? standardLetters(search.ionSeries)
+                : overrideIonTypes;
+        if (letters.isEmpty()) {
+            System.err.println("WARNING: the search declares no standard ion series; defaulting to b, y");
+            letters = Arrays.asList("b", "y");
+        }
+        List<String> backboneLabels = new ArrayList<>(letters);
+        for (CustomIon ci : search.customIons) {
+            if (!backboneLabels.contains(ci.name)) backboneLabels.add(ci.name);
+        }
+        backboneSeries = FragmentAnnotator.resolveSeries(backboneLabels, search.customIons);
+        System.out.println("Backbone ion series: " + backboneLabels);
+
+        if (search.labile) {
+            // The base series for fragment remainders are the ones MSFragger generated them for,
+            // intersected with what is being annotated. Only a search that declared NO labile
+            // series falls back to all of them: an empty intersection means the declared series
+            // are simply not being annotated, and widening it there would put remainders on series
+            // the search never generated any for.
+            List<String> labileLabels = new ArrayList<>();
+            if (search.labileSeries.isEmpty()) {
+                labileLabels = backboneLabels;
+            } else {
+                for (String l : search.labileSeries) if (backboneLabels.contains(l)) labileLabels.add(l);
+                if (labileLabels.isEmpty()) {
+                    System.err.println("WARNING: the search generated fragment remainders for "
+                            + search.labileSeries + ", none of which are being annotated, so the "
+                            + "fragment remainder column will be empty.");
+                }
+            }
+            labileSeries = FragmentAnnotator.resolveSeries(labileLabels, search.customIons);
+
+            if (!search.offsets.isEmpty()) {
+                System.out.println("Labile mode: " + search.offsets.size() + " mass offset(s), "
+                        + "remainder series " + labileLabels);
+            } else if (search.globalOffset != null) {
+                // No per-mass entry to match, but the search's global ion lists say what a labile
+                // modification produces. This is the shape of a glyco search run without detailed
+                // offsets, where the glycan masses live only in the detailed parameter.
+                System.out.println("Labile mode: no per-mass offsets; using the search's global "
+                        + "diagnostic / Y-type / remainder lists, remainder series " + labileLabels);
+            } else {
+                System.err.println("WARNING: labile search mode is on but no labile mass offsets "
+                        + "could be read from fragpipe.workflow; the labile columns will be empty.");
+            }
+        }
+
+        categories.add(IonCategory.BACKBONE);
+        if (search.labile) {
+            categories.add(IonCategory.FRAG_REMAINDER);
+            categories.add(IonCategory.PEP_REMAINDER);
+            categories.add(IonCategory.DIAGNOSTIC);
+        }
+    }
+
+    /**
+     * The standard backbone letters among the search's declared series. Case is significant:
+     * uppercase {@code Y} is MSFragger's peptide-remainder series, not the backbone {@code y}, and
+     * is annotated as a peptide remainder rather than as a backbone ion. Custom names are resolved
+     * separately, so anything else here is a series this result cannot generate.
+     */
+    private List<String> standardLetters(List<String> declared) {
+        List<String> out = new ArrayList<>();
+        List<String> unknown = new ArrayList<>();
+        for (String s : declared) {
+            if (s.length() == 1 && "abcxyz".contains(s)) {
+                if (!out.contains(s)) out.add(s);
+            } else if (s.equals("Y")) {
+                continue; // handled as a peptide remainder, not a backbone series
+            } else if (!hasCustom(s)) {
+                unknown.add(s);
+            }
+        }
+        if (!unknown.isEmpty()) {
+            System.err.println("WARNING: fragment_ion_series names series this result does not "
+                    + "declare and cannot generate: " + unknown);
+        }
+        return out;
+    }
+
+    private boolean hasCustom(String name) {
+        for (CustomIon c : search.customIons) if (c.name.equals(name)) return true;
+        return false;
+    }
+
+    /**
+     * Load the glycan residue and modification databases, when FragPipe supplied them.
+     * Pre-populates {@link FragmentAnnotator#glycoShortNames} for all loaded residues so label
+     * generation is deterministic and thread-safe during annotation.
      */
     private void initGlycanResiduesMap() {
         if (glycanResiduesPath != null && !glycanResiduesPath.isEmpty()) {
@@ -114,6 +228,14 @@ public class ExportFragments {
                     GlycanParser.parseGlycoModsDB(glycanModsPath, glycanResiduesMap.size(), glycanResiduesMap);
             glycanResiduesMap.putAll(modsMap);
         }
+        if (glycanResiduesMap.isEmpty()) {
+            if (search.nglycanMode) {
+                System.err.println("WARNING: this is an N-glycan search but no glycan residue "
+                        + "database was supplied, so glycan ions will be named by mass rather than "
+                        + "by composition.");
+            }
+            return;
+        }
         // Pre-register short names for all loaded residues before threads start.
         for (GlycanResidue residue : glycanResiduesMap.values()) {
             FragmentAnnotator.getOrCreateShortName(residue);
@@ -121,24 +243,10 @@ public class ExportFragments {
         System.out.println("Loaded " + glycanResiduesMap.size() + " glycan residue/mod definitions.");
     }
 
-    // Build per-type ionMatches storage.
-    // ngly_ori – original glycan mass at N sites
-    // ngly_0   – 0.0 of N (bare peptide backbone)
-    // ngly_203 – 203.079 of N (core GlcNAc)
-    // ogly_ori – original glycan mass at S/T sites
-    // ogly_0   – 0.0 of ST (bare peptide backbone)
-    private LinkedHashMap<String, ArrayList<IonMatch>[]> buildIonMatchesMap(int size) {
-        LinkedHashMap<String, ArrayList<IonMatch>[]> map = new LinkedHashMap<>();
-        if (hasNgly) {
-            map.put("ngly_ori", new ArrayList[size]);
-            map.put("ngly_0",   new ArrayList[size]);
-            map.put("ngly_203", new ArrayList[size]);
-        }
-        if (hasOgly) {
-            map.put("ogly_ori", new ArrayList[size]);
-            map.put("ogly_0",   new ArrayList[size]);
-        }
-        if (!hasNgly && !hasOgly) map.put("default", new ArrayList[size]);
+    /** Per-category ion-match storage, in the order the columns are written. */
+    private LinkedHashMap<IonCategory, ArrayList<IonMatch>[]> buildIonMatchesMap(int size) {
+        LinkedHashMap<IonCategory, ArrayList<IonMatch>[]> map = new LinkedHashMap<>();
+        for (IonCategory c : categories) map.put(c, new ArrayList[size]);
         return map;
     }
 
@@ -192,7 +300,7 @@ public class ExportFragments {
         return fileToIndices;
     }
 
-/** Load a spectrum's mz/intensity arrays from a scan collection. Returns null on failure. */
+    /** Load a spectrum's mz/intensity arrays from a scan collection. Returns null on failure. */
     private double[][] loadScanArrays(int scanNum, ScanCollectionDefault scans) throws FileParsingException {
         IScan iScan = scans.getScanByNum(scanNum);
         if (iScan == null) return null;
@@ -240,9 +348,19 @@ public class ExportFragments {
         return "\t" + ionsNames + "\t" + ionsMz + "\t" + ionsInt + "\t" + ionsTheoMz + "\t" + ionsPpmError;
     }
 
+    /** The five column names of one category, optionally as the paired-scan copy. */
+    private void appendHeader(StringBuilder sb, IonCategory category, boolean paired) {
+        String prefix = (paired ? "paired_" : "") + category.prefix;
+        sb.append("\t").append(prefix).append("ions")
+          .append("\t").append(prefix).append("ion_mz")
+          .append("\t").append(prefix).append("ion_int")
+          .append("\t").append(prefix).append("ion_theo_mz")
+          .append("\t").append(prefix).append("ion_ppm_error");
+    }
+
     private void writeOneExperiment(String expNum, ArrayList<String[]> onePSMData,
-                                    LinkedHashMap<String, ArrayList<IonMatch>[]> ionMatchesMap,
-                                    LinkedHashMap<String, ArrayList<IonMatch>[]> pairedIonMatchesMap) {
+                                    LinkedHashMap<IonCategory, ArrayList<IonMatch>[]> ionMatchesMap,
+                                    LinkedHashMap<IonCategory, ArrayList<IonMatch>[]> pairedIonMatchesMap) {
         DecimalFormat df    = new DecimalFormat("#.####");
         DecimalFormat dfInt = new DecimalFormat("#.#");
         DecimalFormat dfPpm = new DecimalFormat("#.##");
@@ -256,23 +374,9 @@ public class ExportFragments {
             int columnNum = line.split("\t", -1).length;
 
             StringBuilder headerSuffix = new StringBuilder();
-            for (String type : ionMatchesMap.keySet()) {
-                String prefix = type.equals("default") ? "" : type + "_";
-                headerSuffix.append("\t").append(prefix).append("ions")
-                            .append("\t").append(prefix).append("ion_mz")
-                            .append("\t").append(prefix).append("ion_int")
-                            .append("\t").append(prefix).append("ion_theo_mz")
-                            .append("\t").append(prefix).append("ion_ppm_error");
-            }
+            for (IonCategory category : ionMatchesMap.keySet()) appendHeader(headerSuffix, category, false);
             if (pairedIonMatchesMap != null) {
-                for (String type : pairedIonMatchesMap.keySet()) {
-                    String prefix = "paired_" + (type.equals("default") ? "" : type + "_");
-                    headerSuffix.append("\t").append(prefix).append("ions")
-                                .append("\t").append(prefix).append("ion_mz")
-                                .append("\t").append(prefix).append("ion_int")
-                                .append("\t").append(prefix).append("ion_theo_mz")
-                                .append("\t").append(prefix).append("ion_ppm_error");
-                }
+                for (IonCategory category : pairedIonMatchesMap.keySet()) appendHeader(headerSuffix, category, true);
             }
             bufferedWriter.write(line.stripTrailing() + headerSuffix + "\n");
             bufferedReader.close();
@@ -281,11 +385,11 @@ public class ExportFragments {
                 String[] lineSplit = onePSMData.get(i);
                 bufferedWriter.write(String.join("\t", lineSplit));
                 for (int pad = lineSplit.length; pad < columnNum; pad++) bufferedWriter.write("\t");
-                for (Map.Entry<String, ArrayList<IonMatch>[]> entry : ionMatchesMap.entrySet()) {
+                for (Map.Entry<IonCategory, ArrayList<IonMatch>[]> entry : ionMatchesMap.entrySet()) {
                     bufferedWriter.write(formatIonColumns(entry.getValue()[i], df, dfInt, dfPpm));
                 }
                 if (pairedIonMatchesMap != null) {
-                    for (Map.Entry<String, ArrayList<IonMatch>[]> entry : pairedIonMatchesMap.entrySet()) {
+                    for (Map.Entry<IonCategory, ArrayList<IonMatch>[]> entry : pairedIonMatchesMap.entrySet()) {
                         bufferedWriter.write(formatIonColumns(entry.getValue()[i], df, dfInt, dfPpm));
                     }
                 }
@@ -300,83 +404,99 @@ public class ExportFragments {
     }
 
     private Runnable getOneAnnotation(int psmIndexCount, ArrayList<String[]> onePSMData,
-                                      LinkedHashMap<String, ArrayList<IonMatch>[]> ionMatchesMap,
-                                      LinkedHashMap<String, ArrayList<IonMatch>[]> pairedIonMatchesMap,
+                                      LinkedHashMap<IonCategory, ArrayList<IonMatch>[]> ionMatchesMap,
+                                      LinkedHashMap<IonCategory, ArrayList<IonMatch>[]> pairedIonMatchesMap,
                                       ScanCollectionDefault scans) {
-        boolean anyGlycan = hasNgly || hasOgly;
-        boolean neutral   = ionsTypeArray.contains("neu");
         return () -> {
             try {
-                {
-                    String[] onePSM = onePSMData.get(psmIndexCount);
-                    int scanNum = Integer.parseInt(onePSM[0].split("\\.")[1]);
-                    int chargeValue = Integer.parseInt(onePSM[resultProcessor.chargeIndex]);
+                String[] onePSM = onePSMData.get(psmIndexCount);
+                int scanNum = Integer.parseInt(onePSM[0].split("\\.")[1]);
+                int chargeValue = Integer.parseInt(onePSM[resultProcessor.chargeIndex]);
 
-                    double[][] primaryArrays = loadScanArrays(scanNum, scans);
-                    if (primaryArrays == null) return;
-                    double[] primaryMzs = primaryArrays[0];
-                    double[] primaryIns = primaryArrays[1];
+                double[][] primaryArrays = loadScanArrays(scanNum, scans);
+                if (primaryArrays == null) return;
+                double[] primaryMzs = primaryArrays[0];
+                double[] primaryIns = primaryArrays[1];
 
-                    // Load paired spectrum if available
-                    double[] pairedMzs = null, pairedIns = null;
-                    if (pairedIonMatchesMap != null && resultProcessor.pairedScanNumIndex >= 0
-                            && resultProcessor.pairedScanNumIndex < onePSM.length) {
-                        String pairedScanStr = onePSM[resultProcessor.pairedScanNumIndex].trim();
-                        if (!pairedScanStr.isEmpty()) {
-                            int pairedScanNum = Integer.parseInt(pairedScanStr);
-                            double[][] pairedArrays = loadScanArrays(pairedScanNum, scans);
-                            if (pairedArrays != null) {
-                                pairedMzs = pairedArrays[0];
-                                pairedIns = pairedArrays[1];
-                            }
+                // Load paired spectrum if available
+                double[] pairedMzs = null, pairedIns = null;
+                if (pairedIonMatchesMap != null && resultProcessor.pairedScanNumIndex >= 0
+                        && resultProcessor.pairedScanNumIndex < onePSM.length) {
+                    String pairedScanStr = onePSM[resultProcessor.pairedScanNumIndex].trim();
+                    if (!pairedScanStr.isEmpty()) {
+                        int pairedScanNum = Integer.parseInt(pairedScanStr);
+                        double[][] pairedArrays = loadScanArrays(pairedScanNum, scans);
+                        if (pairedArrays != null) {
+                            pairedMzs = pairedArrays[0];
+                            pairedIns = pairedArrays[1];
                         }
                     }
+                }
 
-                    String assignedMod    = onePSM[resultProcessor.assignenModIndex];
-                    String peptideSequence = onePSM[resultProcessor.peptideSequenceIndex];
-                    ArrayList<ModificationMatch> originalMods = parseModifications(assignedMod, peptideSequence);
+                String assignedMod     = onePSM[resultProcessor.assignenModIndex];
+                String peptideSequence = onePSM[resultProcessor.peptideSequenceIndex];
+                ArrayList<ModificationMatch> mods = parseModifications(assignedMod, peptideSequence);
+                double deltaMass = readDeltaMass(onePSM);
+                Glycan glycan = readGlycan(onePSM);
 
-                    // Parse glycan composition from "Total Glycan Composition" column if present.
-                    // Parsed once per PSM; passed to all annotation passes (used only when
-                    // addGlycanIons = true, i.e., the _ori passes).
-                    Glycan glycan = null;
-                    if (anyGlycan && !glycanResiduesMap.isEmpty()
-                            && resultProcessor.glycanCompositionIndex >= 0
-                            && resultProcessor.glycanCompositionIndex < onePSM.length) {
-                        String glycanStr = onePSM[resultProcessor.glycanCompositionIndex].trim();
-                        if (!glycanStr.isEmpty()) {
-                            glycan = GlycanParser.parseGlycanString(glycanStr, glycanResiduesMap);
-                        }
-                    }
+                EnumMap<IonCategory, ArrayList<IonMatch>> primary = FragmentAnnotator.annotate(
+                        peptideSequence, mods, deltaMass, chargeValue,
+                        primaryMzs, primaryIns,
+                        backboneSeries, labileSeries, search, addNeutralLoss, glycan);
+                store(ionMatchesMap, primary, psmIndexCount);
 
-                    for (Map.Entry<String, ArrayList<IonMatch>[]> entry : ionMatchesMap.entrySet()) {
-                        String type = entry.getKey();
-                        ArrayList<IonMatch>[] typeIonMatches = entry.getValue();
-
-                        ArrayList<ModificationMatch> activeMods = buildModsForType(originalMods, peptideSequence, type);
-
-                        boolean addGlycan = anyGlycan && (type.equals("ngly_ori") || type.equals("ogly_ori"));
-
-                        typeIonMatches[psmIndexCount] = FragmentAnnotator.annotate(
-                                peptideSequence, activeMods, chargeValue,
-                                primaryMzs, primaryIns,
-                                ionsTypeArray, addGlycan, neutral, glycan);
-
-                        if (pairedIonMatchesMap != null) {
-                            ArrayList<IonMatch>[] pairedTypeIonMatches = pairedIonMatchesMap.get(type);
-                            if (pairedMzs != null) {
-                                pairedTypeIonMatches[psmIndexCount] = FragmentAnnotator.annotate(
-                                        peptideSequence, activeMods, chargeValue,
-                                        pairedMzs, pairedIns,
-                                        ionsTypeArray, addGlycan, neutral, glycan);
-                            }
-                        }
-                    }
+                if (pairedIonMatchesMap != null && pairedMzs != null) {
+                    EnumMap<IonCategory, ArrayList<IonMatch>> paired = FragmentAnnotator.annotate(
+                            peptideSequence, mods, deltaMass, chargeValue,
+                            pairedMzs, pairedIns,
+                            backboneSeries, labileSeries, search, addNeutralLoss, glycan);
+                    store(pairedIonMatchesMap, paired, psmIndexCount);
                 }
             } catch (Exception e) {
                 e.printStackTrace();
             }
         };
+    }
+
+    private void store(LinkedHashMap<IonCategory, ArrayList<IonMatch>[]> target,
+                       EnumMap<IonCategory, ArrayList<IonMatch>> matches, int psmIndex) {
+        for (Map.Entry<IonCategory, ArrayList<IonMatch>[]> entry : target.entrySet()) {
+            entry.getValue()[psmIndex] = matches.get(entry.getKey());
+        }
+    }
+
+    /**
+     * The PSM's unlocalized delta mass. FragPipe writes a localized mass offset into
+     * Assigned Modifications and clears this, so a value here is a modification the search could
+     * not place — it still produces diagnostic and peptide remainder ions, which need no position.
+     */
+    private double readDeltaMass(String[] onePSM) {
+        int idx = resultProcessor.deltaMassIndex;
+        if (idx < 0 || idx >= onePSM.length) return 0.0;
+        Double d = SearchParams.parseDouble(onePSM[idx]);
+        return d == null ? 0.0 : d;
+    }
+
+    /**
+     * This PSM's glycan composition, or null. Its presence is what selects composition labels over
+     * mass labels — see docs/adr/0001. A glyco search whose composition column is missing entirely
+     * is warned about once, because that is the case where composition labels were expected.
+     */
+    private Glycan readGlycan(String[] onePSM) {
+        if (glycanResiduesMap.isEmpty()) return null;
+        int idx = resultProcessor.glycanCompositionIndex;
+        if (idx < 0) {
+            if (search.nglycanMode && warnedNoGlycanColumn.compareAndSet(false, true)) {
+                System.err.println("WARNING: this is an N-glycan search but psm.tsv has no "
+                        + "'Total Glycan Composition' column, so glycan ions will be named by mass. "
+                        + "Run PTM-Shepherd's glycan assignment to get composition names.");
+            }
+            return null;
+        }
+        if (idx >= onePSM.length) return null;
+        String glycanStr = onePSM[idx].trim();
+        if (glycanStr.isEmpty()) return null;
+        return GlycanParser.parseGlycanString(glycanStr, glycanResiduesMap);
     }
 
     /**
@@ -434,50 +554,7 @@ public class ExportFragments {
         return null;
     }
 
-    /**
-     * Build the mod list for a specific annotation type variant.
-     * For N-glycan types, replaces glycan mods (N with mass>500) with the
-     * appropriate variant mass. For O-glycan types, similar for S/T>100.
-     */
-    private ArrayList<ModificationMatch> buildModsForType(
-            ArrayList<ModificationMatch> originalMods, String peptideSequence, String type) {
-
-        if (type.equals("default")) return originalMods;
-
-        ArrayList<ModificationMatch> newMods = new ArrayList<>();
-        for (ModificationMatch mm : originalMods) {
-            String ptm = mm.getTheoreticPtm();
-            if (!ptm.contains(" of ")) { newMods.add(mm); continue; }
-            String residue = ptm.split(" of ")[1];
-            double mass    = mm.getMass();
-            int site       = mm.getModificationSite();
-
-            if (type.startsWith("ngly") && residue.equals("N")
-                    && (mass > 500 || ptm.startsWith("203.079") || ptm.startsWith("0.0"))) {
-                switch (type) {
-                    case "ngly_ori": newMods.add(mm); break;
-                    case "ngly_0":
-                        newMods.add(new ModificationMatch("0.0 of N", site, 0.0)); break;
-                    case "ngly_203":
-                        newMods.add(new ModificationMatch("203.079 of N", site, 203.07937)); break;
-                }
-            } else if (type.startsWith("ogly")
-                    && (residue.equals("S") || residue.equals("T") || residue.equals("ST"))
-                    && (mass > 100 || ptm.startsWith("0.0"))) {
-                switch (type) {
-                    case "ogly_ori": newMods.add(mm); break;
-                    case "ogly_0":
-                        newMods.add(new ModificationMatch("0.0 of ST", site, 0.0)); break;
-                }
-            } else {
-                newMods.add(mm);
-            }
-        }
-        return newMods;
-    }
-
-
-private Boolean checkFileOpen(File eachFile) {
+    private Boolean checkFileOpen(File eachFile) {
         return Files.exists(eachFile.toPath()) && Files.isRegularFile(eachFile.toPath())
                 && Files.isReadable(eachFile.toPath());
     }

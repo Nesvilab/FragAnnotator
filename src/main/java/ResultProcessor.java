@@ -77,7 +77,7 @@ public class ResultProcessor {
     /**
      * Protein result file column index
      */
-    public int spectrumIndex = -1, peptideSequenceIndex = -1, chargeIndex = -1, caculatedMZIndex = -1, observedMZIndex = -1, assignenModIndex = -1, pairedScanNumIndex = -1, glycanCompositionIndex = -1;
+    public int spectrumIndex = -1, peptideSequenceIndex = -1, chargeIndex = -1, caculatedMZIndex = -1, observedMZIndex = -1, assignenModIndex = -1, pairedScanNumIndex = -1, glycanCompositionIndex = -1, deltaMassIndex = -1;
 
 
     public ResultProcessor(File resultsFolder) {
@@ -371,6 +371,10 @@ public class ResultProcessor {
                 assignenModIndex = i;
             } else if (header.equalsIgnoreCase("Total Glycan Composition")) {
                 glycanCompositionIndex = i;
+            } else if (header.equalsIgnoreCase("Delta Mass")) {
+                // An offset the search could not localize survives only here, with no position.
+                deltaMassIndex = i;
+                psmIndexToName.put(i, header.trim().replace(" ", ""));
             } else if (header.equalsIgnoreCase("Paired Scan Num")) {
                 hasPairedScanNum = true;
                 pairedScanNumIndex = i;
