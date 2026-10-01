@@ -1,15 +1,16 @@
 /**
  * One user-defined fragment ion series from {@code msfragger.ion_series_definitions}, e.g.
- * {@code zOne C -16.01872;cdot N 0.02381}. Handled exactly like a standard series: generated
+ * {@code zdot C 1.991841;cdot N 0.02381}. Handled exactly like a standard series: generated
  * across the whole backbone at every charge, and reported in the backbone column under the name
  * the user gave it.
  *
- * <p>{@link #offset} is stated against the <b>ordinary ion of that terminus</b>, which is what
- * MSFragger's own parameter examples say: {@code b* N -17.026548} is b-NH3 and
- * {@code b0 N -18.010565} is b-H2O, so an N-terminal offset is relative to <b>b</b>;
- * {@code zOne C -16.01872} is the z-radical (y-NH2), so a C-terminal one is relative to <b>y</b>.
- * Getting the base wrong moves every custom ion by 18 Da, which annotates nothing and looks
- * exactly like a series the search never used.
+ * <p>{@link #offset} is the number exactly as MSFragger uses it: added to the <b>bare residue
+ * sum</b> of the fragment, at either terminus. That is the same field where MSFragger's built-in
+ * b is 0, y is +18.010565 and z-radical is +1.991841, so {@code b* N -17.026548} is b-NH3 and
+ * {@code zdot C 1.991841} is the z-radical (y-NH2). For an N-terminal series the residue sum is
+ * the b neutral; for a C-terminal one it is y <b>without its water</b>. Getting the base wrong
+ * moves every custom ion by 18 Da, which annotates nothing and looks exactly like a series the
+ * search never used.
  */
 public class CustomIon {
 
@@ -26,11 +27,12 @@ public class CustomIon {
 
     /**
      * The shift from this series' base neutral mass: the b neutral for an N-terminal series, the y
-     * neutral for a C-terminal one. Both bases are the ordinary ion of that terminus, and the y
-     * neutral already carries its water, so the declared offset applies unchanged in both cases.
+     * neutral for a C-terminal one. MSFragger's offset is relative to the bare residue sum, which
+     * is the b neutral already but is one water short of the y neutral, so a C-terminal offset
+     * loses that water here.
      */
     public double shiftFromBase() {
-        return offset;
+        return nterm ? offset : offset - FragmentAnnotator.H2O;
     }
 
     @Override

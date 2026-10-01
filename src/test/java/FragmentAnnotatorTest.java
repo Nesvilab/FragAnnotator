@@ -2,6 +2,7 @@ import org.junit.jupiter.api.Test;
 
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.EnumMap;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -26,25 +27,47 @@ class FragmentAnnotatorTest {
     }
 
     @Test
-    void customSeriesShiftIsRelativeToItsTerminusOrdinaryIon() {
-        // The reference search's zOne is the z-radical, i.e. y - NH2. Resolving it against the
-        // wrong base moves every custom C-terminal ion by 18 Da, which annotates nothing and looks
-        // exactly like a series the search never used.
+    void customSeriesOffsetIsRelativeToTheBareResidueSum() {
+        // MSFragger adds a custom offset to the residue sum at either terminus, in the same field
+        // where its built-in z is +1.991841 and y is +18.010565. So zdot below is MSFragger's own
+        // z-radical. Resolving a C-terminal offset against y instead moves every custom ion by
+        // 18 Da, which annotates nothing and looks exactly like a series the search never used.
         List<CustomIon> custom = List.of(
-                new CustomIon("zOne", false, -16.01872),
+                new CustomIon("zdot", false, 1.991841),
                 new CustomIon("cdot", true, 0.02381));
         List<FragmentAnnotator.Series> resolved =
-                FragmentAnnotator.resolveSeries(Arrays.asList("zOne", "cdot", "z"), custom);
+                FragmentAnnotator.resolveSeries(Arrays.asList("zdot", "cdot", "z"), custom);
 
-        FragmentAnnotator.Series zOne = seriesNamed(resolved, "zOne");
+        FragmentAnnotator.Series zdot = seriesNamed(resolved, "zdot");
         FragmentAnnotator.Series z = seriesNamed(resolved, "z");
-        assertFalse(zOne.nterm);
-        assertEquals(z.shift, zOne.shift, 1e-5,
-                "zOne is z-radical, so its shift must match the standard z series");
+        assertFalse(zdot.nterm);
+        assertEquals(z.shift, zdot.shift, 1e-5,
+                "zdot C 1.991841 is the z-radical, so its shift must match the standard z series");
 
         FragmentAnnotator.Series cdot = seriesNamed(resolved, "cdot");
         assertTrue(cdot.nterm);
-        assertEquals(0.02381, cdot.shift, 1e-9, "an N-terminal offset applies to b unchanged");
+        assertEquals(0.02381, cdot.shift, 1e-9,
+                "b is the bare residue sum, so an N-terminal offset applies to it unchanged");
+    }
+
+    @Test
+    void customCTerminalIonIsAnnotatedWhereMSFraggerScoredIt() {
+        // "zstar C -16.01872" on a C-terminal K is scored by MSFragger at
+        // 128.09496 - 16.01872 + proton = 113.0835, not at y1 - 16.01872 = 131.0941.
+        FragmentAnnotator.configureTolerance(20, false);
+        List<FragmentAnnotator.Series> backbone = FragmentAnnotator.resolveSeries(
+                List.of("zstar"), List.of(new CustomIon("zstar", false, -16.01872)));
+        double[] mzs = {113.08352, 131.09408};
+        double[] ints = {100, 100};
+
+        EnumMap<IonCategory, ArrayList<IonMatch>> result = FragmentAnnotator.annotate(
+                "AK", new ArrayList<>(), 0.0, 1, mzs, ints, backbone, List.of(),
+                SearchParams.parse(""), false, null);
+
+        List<IonMatch> matched = result.get(IonCategory.BACKBONE);
+        assertEquals(1, matched.size());
+        assertEquals("zstar1", matched.get(0).label);
+        assertEquals(113.08352, matched.get(0).theoMz, 1e-4);
     }
 
     @Test

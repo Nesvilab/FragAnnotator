@@ -77,6 +77,20 @@ class SearchParamsTest {
     }
 
     @Test
+    void customOffsetsMeanWhatMSFraggerMakesOfThem() {
+        // MSFragger adds the declared number to the bare residue sum at either terminus. That is
+        // already b's base, but y carries a water on top, so a C-terminal offset sits one water
+        // below y. zdot C 1.991841 is MSFragger's z-radical: y - 16.01872.
+        SearchParams s = SearchParams.parse(
+                "msfragger.ion_series_definitions=zdot C 1.991841;cdot N 0.02381\n");
+        CustomIon zdot = s.customIons.get(0);
+        CustomIon cdot = s.customIons.get(1);
+        assertEquals(1.991841, zdot.offset, 1e-9, "the declared number is kept as written");
+        assertEquals(-16.01872, zdot.shiftFromBase(), 1e-5);
+        assertEquals(0.02381, cdot.shiftFromBase(), 1e-9);
+    }
+
+    @Test
     void dropsCustomDefinitionsWithAnUnknownTerminus() {
         SearchParams s = SearchParams.parse("msfragger.ion_series_definitions=bad X 1.0;ok N 2.0\n");
         assertEquals(1, s.customIons.size());

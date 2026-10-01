@@ -125,6 +125,8 @@ public class FragmentAnnotator {
     /**
      * One ion series: a label, a terminus, and the shift from that terminus' ordinary ion (b for
      * N-terminal, y for C-terminal). Standard and user-defined series differ only in their values.
+     * A user-defined offset is NOT on this base — MSFragger states it against the bare residue
+     * sum — so it enters only through {@link CustomIon#shiftFromBase()}.
      */
     public static class Series {
         public final String label;

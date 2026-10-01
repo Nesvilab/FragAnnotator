@@ -112,5 +112,6 @@ are produced by both.
 
 A user-defined backbone series (`ion_series_definitions`), declared as a name, a terminus
 and a mass offset. Walks the whole backbone exactly like a standard series. Its offset is
-stated against the **ordinary ion of its terminus** — `b` for N-terminal, `y` for
-C-terminal.
+stated against the **bare residue sum** of the fragment at either terminus, as MSFragger
+uses it. For an N-terminal series that is `b`; for a C-terminal one it is `y` minus water,
+so the z-radical is `C 1.991841`, not `C -16.01872`.
