@@ -109,6 +109,7 @@ public class ExportFragments {
 
                 executorService.shutdown();
             } catch (IOException | InterruptedException | ExecutionException e) {
+                System.err.println("ERROR: " + e.getMessage());
                 System.exit(1);
                 throw new RuntimeException(e);
             }
@@ -276,19 +277,57 @@ public class ExportFragments {
         File onePSMTable = resultProcessor.resultsDict.get(expNum).get(1);
         ArrayList<String[]> onePSMData = new ArrayList<>();
         if (checkFileOpen(onePSMTable)) {
-            BufferedReader bufferedReader = new BufferedReader(new FileReader(onePSMTable));
-            bufferedReader.readLine(); // skip header
-            String line;
-            while ((line = bufferedReader.readLine()) != null) {
-                // Use limit -1 to preserve trailing empty fields, otherwise rows with
-                // empty trailing columns (e.g. missing Protein Description / Mapped Genes)
-                // would be written shorter than the header and shift the appended ion
-                // columns to the left.
-                onePSMData.add(line.split("\t", -1));
+            try (BufferedReader bufferedReader = new BufferedReader(new FileReader(onePSMTable))) {
+                int width = headerWidth(bufferedReader.readLine());
+                String line;
+                int lineNum = 1;
+                while ((line = bufferedReader.readLine()) != null) {
+                    lineNum++;
+                    // Use limit -1 to preserve trailing empty fields; alignToHeader handles the
+                    // rows whose writer dropped them anyway.
+                    String[] fields = line.split("\t", -1);
+                    String[] aligned = alignToHeader(fields, width);
+                    if (aligned == null) {
+                        throw new IOException(onePSMTable + " line " + lineNum + " has "
+                                + fields.length + " fields but its header has " + width
+                                + ", and the extra fields are not empty. Values with no header "
+                                + "cannot be placed, so the ion columns appended after them would "
+                                + "not sit under their own headers. This file was left unannotated.");
+                    }
+                    onePSMData.add(aligned);
+                }
             }
-            bufferedReader.close();
         }
         return onePSMData;
+    }
+
+    /**
+     * The number of columns a psm.tsv header names. Trailing whitespace is not a column: the header
+     * is written back without it, so a trailing tab counted here would put every row's ion columns
+     * one place right of their headers.
+     */
+    static int headerWidth(String headerLine) {
+        return headerLine.stripTrailing().split("\t", -1).length;
+    }
+
+    /**
+     * One psm.tsv row as exactly {@code width} fields, so that the ion columns appended after it
+     * start at the same column as their headers. A short row — one whose writer dropped empty
+     * trailing fields (Gene, Protein Description, Mapped Genes...) instead of padding them — is
+     * padded, and empty fields past the header are dropped. Returns null when the row has a
+     * non-empty value past the last header, which no alignment can place without discarding it.
+     */
+    static String[] alignToHeader(String[] fields, int width) {
+        if (fields.length == width) return fields;
+        if (fields.length < width) {
+            String[] padded = Arrays.copyOf(fields, width);
+            Arrays.fill(padded, fields.length, width, "");
+            return padded;
+        }
+        for (int i = width; i < fields.length; i++) {
+            if (!fields[i].isBlank()) return null;
+        }
+        return Arrays.copyOf(fields, width);
     }
 
     private HashMap<String, ArrayList<Integer>> groupPSMsByFile(ArrayList<String[]> onePSMData) {
@@ -360,31 +399,38 @@ public class ExportFragments {
 
     private void writeOneExperiment(String expNum, ArrayList<String[]> onePSMData,
                                     LinkedHashMap<IonCategory, ArrayList<IonMatch>[]> ionMatchesMap,
-                                    LinkedHashMap<IonCategory, ArrayList<IonMatch>[]> pairedIonMatchesMap) {
+                                    LinkedHashMap<IonCategory, ArrayList<IonMatch>[]> pairedIonMatchesMap)
+            throws IOException {
         DecimalFormat df    = new DecimalFormat("#.####");
         DecimalFormat dfInt = new DecimalFormat("#.#");
         DecimalFormat dfPpm = new DecimalFormat("#.##");
         System.out.println("Writing " + expNum);
         File onePSMTable = resultProcessor.resultsDict.get(expNum).get(1);
         File onePSMTableWithMatch = new File(onePSMTable.getAbsolutePath().replace("psm.tsv", "psm_with_match.tsv"));
-        try {
-            BufferedWriter bufferedWriter = new BufferedWriter(new FileWriter(onePSMTableWithMatch));
-            BufferedReader bufferedReader = new BufferedReader(new FileReader(onePSMTable));
-            String line = bufferedReader.readLine();
-            int columnNum = line.split("\t", -1).length;
+        String line;
+        try (BufferedReader bufferedReader = new BufferedReader(new FileReader(onePSMTable))) {
+            line = bufferedReader.readLine();
+        }
+        int columnNum = headerWidth(line);
 
+        try (BufferedWriter bufferedWriter = new BufferedWriter(new FileWriter(onePSMTableWithMatch))) {
             StringBuilder headerSuffix = new StringBuilder();
             for (IonCategory category : ionMatchesMap.keySet()) appendHeader(headerSuffix, category, false);
             if (pairedIonMatchesMap != null) {
                 for (IonCategory category : pairedIonMatchesMap.keySet()) appendHeader(headerSuffix, category, true);
             }
             bufferedWriter.write(line.stripTrailing() + headerSuffix + "\n");
-            bufferedReader.close();
 
             for (int i = 0; i < onePSMData.size(); i++) {
                 String[] lineSplit = onePSMData.get(i);
+                // The ion columns start right after the PSM's own fields, so those must number
+                // exactly the header's for each ion column to sit under its own header.
+                if (lineSplit.length != columnNum) {
+                    throw new IOException(onePSMTable + " line " + (i + 2) + ": " + lineSplit.length
+                            + " fields to write against a header of " + columnNum + ", so its ion "
+                            + "columns would not sit under their headers. This file was left unannotated.");
+                }
                 bufferedWriter.write(String.join("\t", lineSplit));
-                for (int pad = lineSplit.length; pad < columnNum; pad++) bufferedWriter.write("\t");
                 for (Map.Entry<IonCategory, ArrayList<IonMatch>[]> entry : ionMatchesMap.entrySet()) {
                     bufferedWriter.write(formatIonColumns(entry.getValue()[i], df, dfInt, dfPpm));
                 }
@@ -395,12 +441,14 @@ public class ExportFragments {
                 }
                 bufferedWriter.write("\n");
             }
-            bufferedWriter.close();
-            onePSMTable.delete();
-            onePSMTableWithMatch.renameTo(onePSMTable);
         } catch (IOException e) {
-            throw new RuntimeException(e);
+            // Only the partial copy is discarded; the original psm.tsv is not touched until the
+            // copy is complete.
+            onePSMTableWithMatch.delete();
+            throw e;
         }
+        onePSMTable.delete();
+        onePSMTableWithMatch.renameTo(onePSMTable);
     }
 
     private Runnable getOneAnnotation(int psmIndexCount, ArrayList<String[]> onePSMData,
