@@ -75,6 +75,14 @@ remainder, peptide remainder and diagnostic columns appear. A search that declar
 offsets but ran with labile mode off is **not** a labile search — those offsets were never
 searched.
 
+### Paired scan
+
+A second spectrum of the same precursor, fragmented by electron activation (ECD/ETD), that
+O-Pair pairs with the collisional scan the search identified the peptide from. The search's
+ion series and labile mode describe the collisional scan only. Electron activation leaves a
+labile modification on the backbone, so a paired scan is annotated with **c and z backbone
+ions carrying every modification intact**, and no remainder or diagnostic ions.
+
 ### Glycopeptide PSM
 
 A PSM whose labile modification is a glycan of known composition. Not a search-level

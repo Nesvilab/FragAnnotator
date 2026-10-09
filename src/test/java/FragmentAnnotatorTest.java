@@ -71,6 +71,35 @@ class FragmentAnnotatorTest {
     }
 
     @Test
+    void pairedScanIsAnnotatedWithIntactCAndZOnly() {
+        // ATK with a HexNAc on T2, as the electron-activation half of an O-Pair pair sees it: the
+        // glycan stays on the backbone. The peaks include b2 and y1, which the collisional search
+        // would annotate, and c2 with the glycan lost, which a labile search would call a
+        // fragment remainder; none of them belongs to the paired scan's c/z annotation.
+        FragmentAnnotator.configureTolerance(20, false);
+        ArrayList<ModificationMatch> mods = new ArrayList<>(List.of(
+                new ModificationMatch("203.07937 of T", 2, 203.07937)));
+        double[] mzs = {
+                131.09408, // z1
+                147.11280, // y1
+                190.11862, // c2 with the glycan lost
+                376.17144, // b2
+                393.19799, // c2, glycan intact
+                435.22113, // z2, glycan intact
+        };
+        double[] ints = new double[mzs.length];
+        Arrays.fill(ints, 100);
+
+        List<IonMatch> matched = FragmentAnnotator.annotateBackbone(
+                "ATK", mods, 1, mzs, ints, ExportFragments.PAIRED_SERIES);
+
+        List<String> labels = new ArrayList<>();
+        for (IonMatch m : matched) labels.add(m.label);
+        labels.sort(null);
+        assertEquals(List.of("c2", "z1", "z2"), labels);
+    }
+
+    @Test
     void dropsSeriesTheResultNeverDeclared() {
         List<FragmentAnnotator.Series> s =
                 FragmentAnnotator.resolveSeries(Arrays.asList("b", "nosuch"), List.of());

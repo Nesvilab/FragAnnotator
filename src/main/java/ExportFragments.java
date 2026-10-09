@@ -37,6 +37,16 @@ public class ExportFragments {
     /** The ion categories this result gets columns for. */
     private List<IonCategory> categories = new ArrayList<>();
 
+    /**
+     * The series annotated on a paired scan, whatever the search declared. A paired scan is the
+     * electron-activation half of an O-Pair pair (ECD/ETD); the search's parameters describe only
+     * the collisional scan it identified from, so its series and labile ions do not apply here.
+     * Electron activation leaves a glycan on the backbone, so c and z are annotated with every
+     * modification intact, and nothing else.
+     */
+    static final List<FragmentAnnotator.Series> PAIRED_SERIES =
+            FragmentAnnotator.resolveSeries(List.of("c", "z"), List.of());
+
     private final String glycanResiduesPath;
     private final String glycanModsPath;
     private HashMap<String, GlycanResidue> glycanResiduesMap = new HashMap<>();
@@ -85,8 +95,8 @@ public class ExportFragments {
                     HashMap<String, ArrayList<Integer>> fileToIndices = groupPSMsByFile(onePSMData);
 
                     LinkedHashMap<IonCategory, ArrayList<IonMatch>[]> ionMatchesMap = buildIonMatchesMap(onePSMData.size());
-                    LinkedHashMap<IonCategory, ArrayList<IonMatch>[]> pairedIonMatchesMap =
-                            resultProcessor.hasPairedScanNum ? buildIonMatchesMap(onePSMData.size()) : null;
+                    ArrayList<IonMatch>[] pairedMatches =
+                            resultProcessor.hasPairedScanNum ? new ArrayList[onePSMData.size()] : null;
 
                     // Open all mzML files and queue per-PSM tasks without waiting between files.
                     // Workers fetch spectra concurrently (overlapping I/O with CPU work).
@@ -99,12 +109,12 @@ public class ExportFragments {
                         for (int psmIndex : indices) {
                             futures.add(executorService.submit(
                                     getOneAnnotation(psmIndex, onePSMData,
-                                            ionMatchesMap, pairedIonMatchesMap, scans)));
+                                            ionMatchesMap, pairedMatches, scans)));
                         }
                     }
                     for (Future<?> future : futures) future.get();
 
-                    writeOneExperiment(expNum, onePSMData, ionMatchesMap, pairedIonMatchesMap);
+                    writeOneExperiment(expNum, onePSMData, ionMatchesMap, pairedMatches);
                 }
 
                 executorService.shutdown();
@@ -182,6 +192,11 @@ public class ExportFragments {
             categories.add(IonCategory.FRAG_REMAINDER);
             categories.add(IonCategory.PEP_REMAINDER);
             categories.add(IonCategory.DIAGNOSTIC);
+        }
+
+        if (resultProcessor.hasPairedScanNum) {
+            System.out.println("Paired scans: c, z backbone ions with all modifications intact "
+                    + "(the search's ion series apply to the primary scan only)");
         }
     }
 
@@ -399,7 +414,7 @@ public class ExportFragments {
 
     private void writeOneExperiment(String expNum, ArrayList<String[]> onePSMData,
                                     LinkedHashMap<IonCategory, ArrayList<IonMatch>[]> ionMatchesMap,
-                                    LinkedHashMap<IonCategory, ArrayList<IonMatch>[]> pairedIonMatchesMap)
+                                    ArrayList<IonMatch>[] pairedMatches)
             throws IOException {
         DecimalFormat df    = new DecimalFormat("#.####");
         DecimalFormat dfInt = new DecimalFormat("#.#");
@@ -416,9 +431,8 @@ public class ExportFragments {
         try (BufferedWriter bufferedWriter = new BufferedWriter(new FileWriter(onePSMTableWithMatch))) {
             StringBuilder headerSuffix = new StringBuilder();
             for (IonCategory category : ionMatchesMap.keySet()) appendHeader(headerSuffix, category, false);
-            if (pairedIonMatchesMap != null) {
-                for (IonCategory category : pairedIonMatchesMap.keySet()) appendHeader(headerSuffix, category, true);
-            }
+            // One group only: the paired scan carries backbone ions and no labile categories.
+            if (pairedMatches != null) appendHeader(headerSuffix, IonCategory.BACKBONE, true);
             bufferedWriter.write(line.stripTrailing() + headerSuffix + "\n");
 
             for (int i = 0; i < onePSMData.size(); i++) {
@@ -434,10 +448,8 @@ public class ExportFragments {
                 for (Map.Entry<IonCategory, ArrayList<IonMatch>[]> entry : ionMatchesMap.entrySet()) {
                     bufferedWriter.write(formatIonColumns(entry.getValue()[i], df, dfInt, dfPpm));
                 }
-                if (pairedIonMatchesMap != null) {
-                    for (Map.Entry<IonCategory, ArrayList<IonMatch>[]> entry : pairedIonMatchesMap.entrySet()) {
-                        bufferedWriter.write(formatIonColumns(entry.getValue()[i], df, dfInt, dfPpm));
-                    }
+                if (pairedMatches != null) {
+                    bufferedWriter.write(formatIonColumns(pairedMatches[i], df, dfInt, dfPpm));
                 }
                 bufferedWriter.write("\n");
             }
@@ -453,7 +465,7 @@ public class ExportFragments {
 
     private Runnable getOneAnnotation(int psmIndexCount, ArrayList<String[]> onePSMData,
                                       LinkedHashMap<IonCategory, ArrayList<IonMatch>[]> ionMatchesMap,
-                                      LinkedHashMap<IonCategory, ArrayList<IonMatch>[]> pairedIonMatchesMap,
+                                      ArrayList<IonMatch>[] pairedMatches,
                                       ScanCollectionDefault scans) {
         return () -> {
             try {
@@ -468,7 +480,7 @@ public class ExportFragments {
 
                 // Load paired spectrum if available
                 double[] pairedMzs = null, pairedIns = null;
-                if (pairedIonMatchesMap != null && resultProcessor.pairedScanNumIndex >= 0
+                if (pairedMatches != null && resultProcessor.pairedScanNumIndex >= 0
                         && resultProcessor.pairedScanNumIndex < onePSM.length) {
                     String pairedScanStr = onePSM[resultProcessor.pairedScanNumIndex].trim();
                     if (!pairedScanStr.isEmpty()) {
@@ -493,12 +505,9 @@ public class ExportFragments {
                         backboneSeries, labileSeries, search, addNeutralLoss, glycan);
                 store(ionMatchesMap, primary, psmIndexCount);
 
-                if (pairedIonMatchesMap != null && pairedMzs != null) {
-                    EnumMap<IonCategory, ArrayList<IonMatch>> paired = FragmentAnnotator.annotate(
-                            peptideSequence, mods, deltaMass, chargeValue,
-                            pairedMzs, pairedIns,
-                            backboneSeries, labileSeries, search, addNeutralLoss, glycan);
-                    store(pairedIonMatchesMap, paired, psmIndexCount);
+                if (pairedMatches != null && pairedMzs != null) {
+                    pairedMatches[psmIndexCount] = FragmentAnnotator.annotateBackbone(
+                            peptideSequence, mods, chargeValue, pairedMzs, pairedIns, PAIRED_SERIES);
                 }
             } catch (Exception e) {
                 e.printStackTrace();

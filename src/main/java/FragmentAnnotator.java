@@ -233,71 +233,12 @@ public class FragmentAnnotator {
         for (IonCategory c : IonCategory.values()) result.put(c, new ArrayList<>());
         if (specMzs == null || specMzs.length == 0) return result;
 
-        int n = sequence.length();
+        Peptide pep = new Peptide(sequence, mods);
+        int n = pep.n;
+        int maxCharge = maxCharge(precursorCharge);
 
-        // Per-position mod mass arrays (1-indexed: index 1..n for residues)
-        double nTermDelta = 0.0;
-        double cTermDelta = 0.0;
-        double[] resDelta = new double[n + 1];
-
-        for (ModificationMatch mm : mods) {
-            double mass = mm.getMass();
-            if (mm.isNTerminal()) {
-                nTermDelta += mass;
-            } else if (mm.isCTerminal()) {
-                cTermDelta += mass;
-            } else {
-                int pos = mm.getModificationSite();
-                if (pos >= 1 && pos <= n) resDelta[pos] += mass;
-            }
-        }
-
-        // Prefix sums including residue + mod mass at each position
-        double[] prefix = new double[n + 1];
-        for (int i = 1; i <= n; i++) {
-            double aaMass = AA_MASS.getOrDefault(sequence.charAt(i - 1), 0.0);
-            prefix[i] = prefix[i - 1] + aaMass + resDelta[i];
-        }
-
-        double totalPeptideMass = prefix[n] + H2O + nTermDelta + cTermDelta;
-        int maxCharge = Math.min(Math.max(precursorCharge, 1), 4);
-
-        // Backbone ions -----------------------------------------------------
-        List<double[]> neutralLosses = new ArrayList<>();
-        if (addNeutralLoss) {
-            neutralLosses.add(new double[]{H2O, 0});
-            neutralLosses.add(new double[]{NH3, 1});
-            for (ModificationMatch mm : mods) {
-                if (isPhospho(mm)) {
-                    neutralLosses.add(new double[]{H3PO4, 2});
-                    break;
-                }
-            }
-        }
-        String[] lossNames = {"-H2O", "-NH3", "-H3PO4"};
-
-        ArrayList<IonMatch> backboneOut = result.get(IonCategory.BACKBONE);
-        for (int i = 1; i < n; i++) {
-            double bNeutral = prefix[i] + nTermDelta;
-            double yNeutral = prefix[n] - prefix[i] + H2O + cTermDelta;
-
-            for (Series s : backbone) {
-                double neutral = (s.nterm ? bNeutral : yNeutral) + s.shift;
-                int index = s.nterm ? i : n - i;
-                for (int z = 1; z <= maxCharge; z++) {
-                    String name = s.label + index + chargeStr(z);
-                    addMatch(backboneOut, specMzs, specInts, name, (neutral + z * PROTON) / z);
-
-                    // Neutral losses stay on b and y only, as before.
-                    if (!s.label.equals("b") && !s.label.equals("y")) continue;
-                    for (double[] loss : neutralLosses) {
-                        addMatch(backboneOut, specMzs, specInts,
-                                name + lossNames[(int) loss[1]],
-                                (neutral - loss[0] + z * PROTON) / z);
-                    }
-                }
-            }
-        }
+        addBackbone(result.get(IonCategory.BACKBONE), specMzs, specInts, pep, backbone, maxCharge,
+                neutralLosses(mods, addNeutralLoss));
 
         // A search with no per-mass offsets may still have global ion lists a glycan can use: a
         // glyco search keeps its glycan masses in mass_offsets_detailed and writes mass_offsets=0,
@@ -335,10 +276,121 @@ public class FragmentAnnotator {
 
         annotateDiagnostic(result.get(IonCategory.DIAGNOSTIC), specMzs, specInts, hits, glycan != null);
         annotatePepRemainders(result.get(IonCategory.PEP_REMAINDER), specMzs, specInts,
-                hits, totalPeptideMass, maxCharge, glycan);
+                hits, pep.mass(), maxCharge, glycan);
         annotateFragRemainders(result.get(IonCategory.FRAG_REMAINDER), specMzs, specInts,
-                hits, prefix, nTermDelta, cTermDelta, n, labileBases, maxCharge);
+                hits, pep.prefix, pep.nTermDelta, pep.cTermDelta, n, labileBases, maxCharge);
         return result;
+    }
+
+    /**
+     * Backbone ions alone, every modification intact, in exactly the given series — nothing
+     * labile, whatever the search declared. For a spectrum the search parameters do not describe:
+     * the paired electron-activation scan of an O-Pair result, where a glycan stays on the
+     * backbone and the search's own series and remainders belong to the collisional scan.
+     */
+    public static ArrayList<IonMatch> annotateBackbone(
+            String sequence,
+            ArrayList<ModificationMatch> mods,
+            int precursorCharge,
+            double[] specMzs,
+            double[] specInts,
+            List<Series> series) {
+        ArrayList<IonMatch> out = new ArrayList<>();
+        if (specMzs == null || specMzs.length == 0) return out;
+        addBackbone(out, specMzs, specInts, new Peptide(sequence, mods), series,
+                maxCharge(precursorCharge), List.of());
+        return out;
+    }
+
+    /**
+     * A peptide's residue masses with its modifications in place, summed from the N-terminus.
+     * Every fragment's neutral mass is read from these.
+     */
+    private static class Peptide {
+        final int n;
+        final double nTermDelta;
+        final double cTermDelta;
+        /** prefix[i] is residues 1..i with their modifications; prefix[0] is 0. */
+        final double[] prefix;
+
+        Peptide(String sequence, List<ModificationMatch> mods) {
+            n = sequence.length();
+            double nDelta = 0.0;
+            double cDelta = 0.0;
+            double[] resDelta = new double[n + 1];
+            for (ModificationMatch mm : mods) {
+                double mass = mm.getMass();
+                if (mm.isNTerminal()) {
+                    nDelta += mass;
+                } else if (mm.isCTerminal()) {
+                    cDelta += mass;
+                } else {
+                    int pos = mm.getModificationSite();
+                    if (pos >= 1 && pos <= n) resDelta[pos] += mass;
+                }
+            }
+            nTermDelta = nDelta;
+            cTermDelta = cDelta;
+            prefix = new double[n + 1];
+            for (int i = 1; i <= n; i++) {
+                double aaMass = AA_MASS.getOrDefault(sequence.charAt(i - 1), 0.0);
+                prefix[i] = prefix[i - 1] + aaMass + resDelta[i];
+            }
+        }
+
+        /** The intact peptide's neutral mass. */
+        double mass() {
+            return prefix[n] + H2O + nTermDelta + cTermDelta;
+        }
+    }
+
+    private static int maxCharge(int precursorCharge) {
+        return Math.min(Math.max(precursorCharge, 1), 4);
+    }
+
+    private static final String[] LOSS_NAMES = {"-H2O", "-NH3", "-H3PO4"};
+
+    /** The neutral losses to annotate: {mass, index into LOSS_NAMES}. Empty unless requested. */
+    private static List<double[]> neutralLosses(List<ModificationMatch> mods, boolean addNeutralLoss) {
+        List<double[]> losses = new ArrayList<>();
+        if (!addNeutralLoss) return losses;
+        losses.add(new double[]{H2O, 0});
+        losses.add(new double[]{NH3, 1});
+        for (ModificationMatch mm : mods) {
+            if (isPhospho(mm)) {
+                losses.add(new double[]{H3PO4, 2});
+                break;
+            }
+        }
+        return losses;
+    }
+
+    /** Every series walked along the backbone with all modifications intact. */
+    private static void addBackbone(ArrayList<IonMatch> out, double[] specMzs, double[] specInts,
+                                    Peptide pep, List<Series> series, int maxCharge,
+                                    List<double[]> neutralLosses) {
+        int n = pep.n;
+        for (int i = 1; i < n; i++) {
+            double bNeutral = pep.prefix[i] + pep.nTermDelta;
+            double yNeutral = pep.prefix[n] - pep.prefix[i] + H2O + pep.cTermDelta;
+
+            for (Series s : series) {
+                double neutral = (s.nterm ? bNeutral : yNeutral) + s.shift;
+                int index = s.nterm ? i : n - i;
+                for (int z = 1; z <= maxCharge; z++) {
+                    String name = s.label + index + chargeStr(z);
+                    addMatch(out, specMzs, specInts, name, (neutral + z * PROTON) / z);
+
+                    // Neutral losses stay on b and y only, as before.
+                    if (!s.label.equals("b") && !s.label.equals("y")) continue;
+                    for (double[] loss : neutralLosses) {
+                        addMatch(out, specMzs, specInts,
+                                name + LOSS_NAMES[(int) loss[1]],
+                                (neutral - loss[0] + z * PROTON) / z);
+                    }
+                }
+            }
+        }
     }
 
     /** Whether some hit already explains a modification of this mass. */
