@@ -1,7 +1,4 @@
-import umich.ms.datatypes.LCMSDataSubset;
 import umich.ms.datatypes.scan.IScan;
-import umich.ms.datatypes.scan.StorageStrategy;
-import umich.ms.datatypes.scancollection.impl.ScanCollectionDefault;
 import umich.ms.datatypes.spectrum.ISpectrum;
 import umich.ms.fileio.exceptions.FileParsingException;
 import umich.ms.fileio.filetypes.mzml.MZMLFile;
@@ -98,21 +95,25 @@ public class ExportFragments {
                     ArrayList<IonMatch>[] pairedMatches =
                             resultProcessor.hasPairedScanNum ? new ArrayList[onePSMData.size()] : null;
 
-                    // Open all mzML files and queue per-PSM tasks without waiting between files.
-                    // Workers fetch spectra concurrently (overlapping I/O with CPU work).
-                    ArrayList<Future<?>> futures = new ArrayList<>();
+                    // Each file's spectra are read while the previous file's PSMs are annotated, so
+                    // at most two files' spectra are held at once.
+                    ArrayList<Future<?>> inFlight = new ArrayList<>();
                     for (String fileName : fileToIndices.keySet()) {
-                        ScanCollectionDefault scans = openMzmlFile(fileName);
-                        if (scans == null) continue;
                         ArrayList<Integer> indices = fileToIndices.get(fileName);
+                        Map<Integer, double[][]> spectra =
+                                readSpectra(fileName, scanNumsOf(indices, onePSMData));
+                        if (spectra == null) continue;
                         System.out.println("Annotating " + indices.size() + " PSMs from " + fileName);
+                        ArrayList<Future<?>> submitted = new ArrayList<>();
                         for (int psmIndex : indices) {
-                            futures.add(executorService.submit(
+                            submitted.add(executorService.submit(
                                     getOneAnnotation(psmIndex, onePSMData,
-                                            ionMatchesMap, pairedMatches, scans)));
+                                            ionMatchesMap, pairedMatches, spectra)));
                         }
+                        for (Future<?> future : inFlight) future.get();
+                        inFlight = submitted;
                     }
-                    for (Future<?> future : futures) future.get();
+                    for (Future<?> future : inFlight) future.get();
 
                     writeOneExperiment(expNum, onePSMData, ionMatchesMap, pairedMatches);
                 }
@@ -266,25 +267,67 @@ public class ExportFragments {
         return map;
     }
 
-    private ScanCollectionDefault openMzmlFile(String spectrumName) {
+    /**
+     * The spectra of the given scans of one mzML file, keyed by scan number. Only these scans are
+     * read, located through the file's index and read in a single pass, rather than parsing every
+     * scan in the file and then reopening it for each spectrum a PSM needs. A scan the file does
+     * not hold is left out. Returns null when the file cannot be read.
+     *
+     * <p>{@link MZMLFile#parse(List)} is deprecated in batmass-io, but it is the only call that
+     * reads a list of scans with the file opened once; reading them one at a time reopens the file
+     * per scan, which is what made annotation slow on network storage.
+     */
+    @SuppressWarnings("deprecation")
+    private Map<Integer, double[][]> readSpectra(String spectrumName, Set<Integer> scanNums) {
         if (!resultProcessor.spectrumFileMap.containsKey(spectrumName)) return null;
         File eachFile = new File(resultProcessor.spectrumFileMap.get(spectrumName));
-        if (eachFile.exists() && eachFile.getName().endsWith(".mzML")) {
-            System.out.println("Reading mzML: " + spectrumName);
-            MZMLFile mzmlFile = new MZMLFile(resultProcessor.spectrumFileMap.get(spectrumName));
-            mzmlFile.setNumThreadsForParsing(threadNum);
-            ScanCollectionDefault scans = new ScanCollectionDefault();
-            scans.setDefaultStorageStrategy(StorageStrategy.SOFT);
-            scans.isAutoloadSpectra(true);
-            scans.setDataSource(mzmlFile);
+        if (!eachFile.exists() || !eachFile.getName().endsWith(".mzML")) return null;
+        System.out.println("Reading mzML: " + spectrumName);
+        MZMLFile mzmlFile = new MZMLFile(resultProcessor.spectrumFileMap.get(spectrumName));
+        mzmlFile.setNumThreadsForParsing(threadNum);
+        try {
+            Set<Integer> inFile = mzmlFile.fetchIndex().getMapByNum().keySet();
+            List<Integer> toRead = new ArrayList<>();
+            for (int scanNum : scanNums) if (inFile.contains(scanNum)) toRead.add(scanNum);
+            Map<Integer, double[][]> spectra = new HashMap<>();
+            if (toRead.isEmpty()) return spectra; // parse() rejects an empty list
+            for (IScan scan : mzmlFile.parse(toRead)) {
+                double[][] arrays = spectrumArrays(scan.getSpectrum());
+                if (arrays != null) spectra.put(scan.getNum(), arrays);
+            }
+            return spectra;
+        } catch (FileParsingException e) {
+            e.printStackTrace();
+            return null;
+        }
+    }
+
+    /** The scans the given PSMs need, in file order: each one's own and its paired scan. */
+    private TreeSet<Integer> scanNumsOf(List<Integer> psmIndices, ArrayList<String[]> onePSMData) {
+        TreeSet<Integer> scanNums = new TreeSet<>();
+        for (int psmIndex : psmIndices) {
+            String[] onePSM = onePSMData.get(psmIndex);
             try {
-                scans.loadData(LCMSDataSubset.STRUCTURE_ONLY);
-                return scans;
-            } catch (FileParsingException e) {
-                e.printStackTrace();
+                scanNums.add(scanNum(onePSM));
+                Integer paired = pairedScanNum(onePSM);
+                if (paired != null) scanNums.add(paired);
+            } catch (NumberFormatException | ArrayIndexOutOfBoundsException e) {
+                // Left for the PSM's own annotation task, which reports it.
             }
         }
-        return null;
+        return scanNums;
+    }
+
+    private static int scanNum(String[] onePSM) {
+        return Integer.parseInt(onePSM[0].split("\\.")[1]);
+    }
+
+    /** The PSM's paired scan number, or null when it has none or this result has no paired scans. */
+    private Integer pairedScanNum(String[] onePSM) {
+        int idx = resultProcessor.pairedScanNumIndex;
+        if (!resultProcessor.hasPairedScanNum || idx < 0 || idx >= onePSM.length) return null;
+        String pairedScanStr = onePSM[idx].trim();
+        return pairedScanStr.isEmpty() ? null : Integer.parseInt(pairedScanStr);
     }
 
     private ArrayList<String[]> readOnePSM(String expNum) throws IOException {
@@ -354,11 +397,8 @@ public class ExportFragments {
         return fileToIndices;
     }
 
-    /** Load a spectrum's mz/intensity arrays from a scan collection. Returns null on failure. */
-    private double[][] loadScanArrays(int scanNum, ScanCollectionDefault scans) throws FileParsingException {
-        IScan iScan = scans.getScanByNum(scanNum);
-        if (iScan == null) return null;
-        ISpectrum iSpectrum = iScan.fetchSpectrum();
+    /** A spectrum's mz/intensity arrays, sorted by m/z. Returns null for a missing spectrum. */
+    private static double[][] spectrumArrays(ISpectrum iSpectrum) {
         if (iSpectrum == null) return null;
         double[] mzs = iSpectrum.getMZs();
         double[] ins  = iSpectrum.getIntensities();
@@ -466,30 +506,25 @@ public class ExportFragments {
     private Runnable getOneAnnotation(int psmIndexCount, ArrayList<String[]> onePSMData,
                                       LinkedHashMap<IonCategory, ArrayList<IonMatch>[]> ionMatchesMap,
                                       ArrayList<IonMatch>[] pairedMatches,
-                                      ScanCollectionDefault scans) {
+                                      Map<Integer, double[][]> spectra) {
         return () -> {
             try {
                 String[] onePSM = onePSMData.get(psmIndexCount);
-                int scanNum = Integer.parseInt(onePSM[0].split("\\.")[1]);
                 int chargeValue = Integer.parseInt(onePSM[resultProcessor.chargeIndex]);
 
-                double[][] primaryArrays = loadScanArrays(scanNum, scans);
+                double[][] primaryArrays = spectra.get(scanNum(onePSM));
                 if (primaryArrays == null) return;
                 double[] primaryMzs = primaryArrays[0];
                 double[] primaryIns = primaryArrays[1];
 
                 // Load paired spectrum if available
                 double[] pairedMzs = null, pairedIns = null;
-                if (pairedMatches != null && resultProcessor.pairedScanNumIndex >= 0
-                        && resultProcessor.pairedScanNumIndex < onePSM.length) {
-                    String pairedScanStr = onePSM[resultProcessor.pairedScanNumIndex].trim();
-                    if (!pairedScanStr.isEmpty()) {
-                        int pairedScanNum = Integer.parseInt(pairedScanStr);
-                        double[][] pairedArrays = loadScanArrays(pairedScanNum, scans);
-                        if (pairedArrays != null) {
-                            pairedMzs = pairedArrays[0];
-                            pairedIns = pairedArrays[1];
-                        }
+                Integer pairedScanNum = pairedScanNum(onePSM);
+                if (pairedScanNum != null) {
+                    double[][] pairedArrays = spectra.get(pairedScanNum);
+                    if (pairedArrays != null) {
+                        pairedMzs = pairedArrays[0];
+                        pairedIns = pairedArrays[1];
                     }
                 }
 
