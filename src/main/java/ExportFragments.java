@@ -91,9 +91,10 @@ public class ExportFragments {
 
                     HashMap<String, ArrayList<Integer>> fileToIndices = groupPSMsByFile(onePSMData);
 
-                    LinkedHashMap<IonCategory, ArrayList<IonMatch>[]> ionMatchesMap = buildIonMatchesMap(onePSMData.size());
-                    ArrayList<IonMatch>[] pairedMatches =
-                            resultProcessor.hasPairedScanNum ? new ArrayList[onePSMData.size()] : null;
+                    // Each PSM's ion columns, formatted by the thread that annotated it.
+                    String[] ionColumns = new String[onePSMData.size()];
+                    String[] pairedColumns =
+                            resultProcessor.hasPairedScanNum ? new String[onePSMData.size()] : null;
 
                     // Each file's spectra are read while the previous file's PSMs are annotated, so
                     // at most two files' spectra are held at once.
@@ -108,14 +109,14 @@ public class ExportFragments {
                         for (int psmIndex : indices) {
                             submitted.add(executorService.submit(
                                     getOneAnnotation(psmIndex, onePSMData,
-                                            ionMatchesMap, pairedMatches, spectra)));
+                                            ionColumns, pairedColumns, spectra)));
                         }
                         for (Future<?> future : inFlight) future.get();
                         inFlight = submitted;
                     }
                     for (Future<?> future : inFlight) future.get();
 
-                    writeOneExperiment(expNum, onePSMData, ionMatchesMap, pairedMatches);
+                    writeOneExperiment(expNum, onePSMData, ionColumns, pairedColumns);
                 }
 
                 executorService.shutdown();
@@ -258,13 +259,6 @@ public class ExportFragments {
             FragmentAnnotator.getOrCreateShortName(residue);
         }
         System.out.println("Loaded " + glycanResiduesMap.size() + " glycan residue/mod definitions.");
-    }
-
-    /** Per-category ion-match storage, in the order the columns are written. */
-    private LinkedHashMap<IonCategory, ArrayList<IonMatch>[]> buildIonMatchesMap(int size) {
-        LinkedHashMap<IonCategory, ArrayList<IonMatch>[]> map = new LinkedHashMap<>();
-        for (IonCategory c : categories) map.put(c, new ArrayList[size]);
-        return map;
     }
 
     /**
@@ -422,10 +416,20 @@ public class ExportFragments {
         for (int i = 0; i < n; i++) { mzs[i] = tmpMz[idx[i]]; ins[i] = tmpIn[idx[i]]; }
     }
 
+    /** One category's five ion columns when it matched nothing. */
+    private static final String NO_IONS = "\t\t\t\t\t";
+
+    // DecimalFormat is not thread-safe, and the columns are formatted on the annotation threads.
+    private static final ThreadLocal<DecimalFormat> MZ_FORMAT  = ThreadLocal.withInitial(() -> new DecimalFormat("#.####"));
+    private static final ThreadLocal<DecimalFormat> INT_FORMAT = ThreadLocal.withInitial(() -> new DecimalFormat("#.#"));
+    private static final ThreadLocal<DecimalFormat> PPM_FORMAT = ThreadLocal.withInitial(() -> new DecimalFormat("#.##"));
+
     // Format one set of 5 ion annotation columns (tab-prefixed) for a single PSM row.
-    private String formatIonColumns(ArrayList<IonMatch> matches, DecimalFormat df,
-                                    DecimalFormat dfInt, DecimalFormat dfPpm) {
-        if (matches == null || matches.isEmpty()) return "\t\t\t\t\t";
+    private static String formatIonColumns(ArrayList<IonMatch> matches) {
+        if (matches == null || matches.isEmpty()) return NO_IONS;
+        DecimalFormat df    = MZ_FORMAT.get();
+        DecimalFormat dfInt = INT_FORMAT.get();
+        DecimalFormat dfPpm = PPM_FORMAT.get();
         ArrayList<String> ionsNames    = new ArrayList<>();
         ArrayList<String> ionsMz       = new ArrayList<>();
         ArrayList<String> ionsInt      = new ArrayList<>();
@@ -453,12 +457,8 @@ public class ExportFragments {
     }
 
     private void writeOneExperiment(String expNum, ArrayList<String[]> onePSMData,
-                                    LinkedHashMap<IonCategory, ArrayList<IonMatch>[]> ionMatchesMap,
-                                    ArrayList<IonMatch>[] pairedMatches)
+                                    String[] ionColumns, String[] pairedColumns)
             throws IOException {
-        DecimalFormat df    = new DecimalFormat("#.####");
-        DecimalFormat dfInt = new DecimalFormat("#.#");
-        DecimalFormat dfPpm = new DecimalFormat("#.##");
         System.out.println("Writing " + expNum);
         File onePSMTable = resultProcessor.resultsDict.get(expNum).get(1);
         File onePSMTableWithMatch = new File(onePSMTable.getAbsolutePath().replace("psm.tsv", "psm_with_match.tsv"));
@@ -470,10 +470,12 @@ public class ExportFragments {
 
         try (BufferedWriter bufferedWriter = new BufferedWriter(new FileWriter(onePSMTableWithMatch))) {
             StringBuilder headerSuffix = new StringBuilder();
-            for (IonCategory category : ionMatchesMap.keySet()) appendHeader(headerSuffix, category, false);
+            for (IonCategory category : categories) appendHeader(headerSuffix, category, false);
             // One group only: the paired scan carries backbone ions and no labile categories.
-            if (pairedMatches != null) appendHeader(headerSuffix, IonCategory.BACKBONE, true);
+            if (pairedColumns != null) appendHeader(headerSuffix, IonCategory.BACKBONE, true);
             bufferedWriter.write(line.stripTrailing() + headerSuffix + "\n");
+            // A PSM that was never annotated, e.g. because its scan is missing from the file.
+            String unannotated = NO_IONS.repeat(categories.size());
 
             for (int i = 0; i < onePSMData.size(); i++) {
                 String[] lineSplit = onePSMData.get(i);
@@ -485,11 +487,9 @@ public class ExportFragments {
                             + "columns would not sit under their headers. This file was left unannotated.");
                 }
                 bufferedWriter.write(String.join("\t", lineSplit));
-                for (Map.Entry<IonCategory, ArrayList<IonMatch>[]> entry : ionMatchesMap.entrySet()) {
-                    bufferedWriter.write(formatIonColumns(entry.getValue()[i], df, dfInt, dfPpm));
-                }
-                if (pairedMatches != null) {
-                    bufferedWriter.write(formatIonColumns(pairedMatches[i], df, dfInt, dfPpm));
+                bufferedWriter.write(ionColumns[i] != null ? ionColumns[i] : unannotated);
+                if (pairedColumns != null) {
+                    bufferedWriter.write(pairedColumns[i] != null ? pairedColumns[i] : NO_IONS);
                 }
                 bufferedWriter.write("\n");
             }
@@ -504,8 +504,7 @@ public class ExportFragments {
     }
 
     private Runnable getOneAnnotation(int psmIndexCount, ArrayList<String[]> onePSMData,
-                                      LinkedHashMap<IonCategory, ArrayList<IonMatch>[]> ionMatchesMap,
-                                      ArrayList<IonMatch>[] pairedMatches,
+                                      String[] ionColumns, String[] pairedColumns,
                                       Map<Integer, double[][]> spectra) {
         return () -> {
             try {
@@ -538,23 +537,18 @@ public class ExportFragments {
                         peptideSequence, mods, deltaMass, chargeValue,
                         primaryMzs, primaryIns,
                         backboneSeries, labileSeries, search, addNeutralLoss, glycan);
-                store(ionMatchesMap, primary, psmIndexCount);
+                StringBuilder columns = new StringBuilder();
+                for (IonCategory category : categories) columns.append(formatIonColumns(primary.get(category)));
+                ionColumns[psmIndexCount] = columns.toString();
 
-                if (pairedMatches != null && pairedMzs != null) {
-                    pairedMatches[psmIndexCount] = FragmentAnnotator.annotateBackbone(
-                            peptideSequence, mods, chargeValue, pairedMzs, pairedIns, PAIRED_SERIES);
+                if (pairedColumns != null && pairedMzs != null) {
+                    pairedColumns[psmIndexCount] = formatIonColumns(FragmentAnnotator.annotateBackbone(
+                            peptideSequence, mods, chargeValue, pairedMzs, pairedIns, PAIRED_SERIES));
                 }
             } catch (Exception e) {
                 e.printStackTrace();
             }
         };
-    }
-
-    private void store(LinkedHashMap<IonCategory, ArrayList<IonMatch>[]> target,
-                       EnumMap<IonCategory, ArrayList<IonMatch>> matches, int psmIndex) {
-        for (Map.Entry<IonCategory, ArrayList<IonMatch>[]> entry : target.entrySet()) {
-            entry.getValue()[psmIndex] = matches.get(entry.getKey());
-        }
     }
 
     /**
